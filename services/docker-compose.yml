@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      labels:
+        - "project=samnet-wg"
+    image: samnet-wg/api:latest
+    container_name: samnet-wg-api
+    restart: unless-stopped
+    # No ports mapping needed - using network_mode: host
+    environment:
+      - SAMNET_DB_PATH=/var/lib/samnet-wg/samnet.db
+      - PORT=${API_PORT:-8766}
+      - GIN_MODE=release
+    volumes:
+      - /var/lib/samnet-wg:/var/lib/samnet-wg
+      - /etc/wireguard:/etc/wireguard
+      - /opt/samnet/clients:/opt/samnet/clients
+    cap_add:
+      - NET_ADMIN
+    network_mode: host # Required for direct wg set access to host WireGuard interface
+    profiles:
+      - web
+    healthcheck:
+      test: curl -f "http://localhost:${API_PORT:-8766}/health/ready" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+      labels:
+        - "project=samnet-wg"
+    image: samnet-wg/ui:latest
+    container_name: samnet-wg-ui
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - NGINX_MODE=${SAMNET_UI_MODE:-lan}
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+    profiles:
+      - web
+    depends_on:
+      - api
