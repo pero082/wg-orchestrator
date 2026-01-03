@@ -1906,7 +1906,7 @@ PrivateKey = $privkey
 MTU = $mtu
 SaveConfig = false
 PostUp = nft -f /etc/nftables.conf
-PostDown = nft flush ruleset
+PostDown = nft delete table inet samnet-filter 2>/dev/null; nft delete table ip samnet-nat 2>/dev/null || true
 
 # Disable IPv6 for this interface specifically to avoid leaks
 # (Though OS-level disable is better, this is safe per-interface)
@@ -2252,8 +2252,11 @@ apply_firewall() {
     
     modprobe nft_chain_nat_ipv4 2>/dev/null || true
     
+    # Pre-clean our tables (Safe - do not flush ruleset)
+    nft delete table inet samnet-filter 2>/dev/null || true
+    nft delete table ip samnet-nat 2>/dev/null || true
+    
     cat > /etc/nftables.conf <<EOF
-flush ruleset
 table inet samnet-filter {
     chain input {
         type filter hook input priority 0; policy drop;
@@ -2281,32 +2284,46 @@ table ip samnet-nat {
 }
 EOF
     
-    if nft -f /etc/nftables.conf && nft list ruleset | grep -q "masquerade"; then
+    if nft -f /etc/nftables.conf; then
         systemctl enable nftables
-        log_success "Firewall rules applied"
+        log_success "Firewall rules applied via nftables"
         rm -f "$backup"
         
         # ─── Docker/iptables Compatibility ───────────────────────────────────────
         # Docker uses iptables with its own FORWARD chain (policy DROP).
-        # nftables rules exist in a separate namespace and don't affect iptables.
-        # When both coexist, iptables blocks wg0 traffic even if nftables allows it.
-        # Solution: Add iptables rules to allow wg0 forwarding when Docker is present.
-        if command -v docker &>/dev/null && iptables -L FORWARD -n 2>/dev/null | grep -q "DOCKER"; then
-            log_info "Docker detected - adding iptables compatibility rules for wg0"
-            
-            # Remove any existing wg0 rules to avoid duplicates
-            iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null || true
-            iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-            
-            # Insert at the beginning of FORWARD chain (before Docker rules)
-            iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT
-            iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
-            
-            # Also add NAT masquerade for wg0 traffic in iptables (Docker's nat table)
-            iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null || true
-            iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE
-            
-            log_success "iptables compatibility rules added for Docker coexistence"
+        # We need to insert rules into iptables to allow traffic, AND persist them.
+        if command -v docker &>/dev/null || [[ -n "$(iptables -L FORWARD -n 2>/dev/null | grep DOCKER)" ]]; then
+            if iptables -L FORWARD -n 2>/dev/null | grep -q "DOCKER"; then
+                log_info "Docker detected - ensuring iptables compatibility settings..."
+                
+                # Remove any existing wg0 rules to avoid duplicates
+                iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null || true
+                iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+                
+                # Insert at the beginning of FORWARD chain (before Docker rules)
+                iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT
+                iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+                
+                # Also add NAT masquerade for wg0 traffic in iptables (Docker's nat table)
+                iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null || true
+                iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE
+                
+                log_success "iptables compatibility rules active"
+
+                # Persistence
+                if ! command -v netfilter-persistent &>/dev/null; then
+                     log_info "Installing iptables-persistent..."
+                     export DEBIAN_FRONTEND=noninteractive
+                     apt-get update -qq &>/dev/null
+                     echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+                     echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+                     apt-get install -y -qq iptables-persistent &>/dev/null
+                fi
+                
+                if command -v netfilter-persistent &>/dev/null; then
+                    netfilter-persistent save >/dev/null 2>&1
+                fi
+            fi
         fi
     else
         log_error "Firewall failed, rolling back..."
