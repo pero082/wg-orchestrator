@@ -21,7 +21,7 @@ export LC_ALL=C.UTF-8
 # 1. GLOBAL CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-readonly SAMNET_VERSION="1.0.0"
+readonly SAMNET_VERSION="1.0.1"
 readonly APP_NAME="SamNet-WG"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1217,9 +1217,9 @@ db_allocate_ip() {
 # Returns a line-delimited list: NAME|IP|SOURCE|STATUS
 scan_peers() {
     local client_dir="$INSTALL_DIR/clients"
-    local peer_map_name=()  # Keys: Name
-    local peer_map_ip=()
-    local peer_map_src=()
+    declare -A peer_map_name  # Keys: Name
+    declare -A peer_map_ip
+    declare -A peer_map_src
     local peer_ids=() # Order preservation
 
     # 1. Source: Filesystem (Primary for Mode A)
@@ -1255,17 +1255,25 @@ scan_peers() {
     fi
 
     # 3. Source: Active Interface (Validation Layer)
-    # Check if they are actually running
-    local wg_dump=""
+    local active_pubs=""
+    local transfer_dump=""
     if command -v wg &>/dev/null && wg show wg0 &>/dev/null; then
-        wg_dump=$(wg show wg0 latest-handshakes)
+        active_pubs=$(wg show wg0 latest-handshakes)
+        transfer_dump=$(wg show wg0 transfer)
+    fi
+    
+    # 4. Usage Limits (Pre-fetch for performance)
+    declare -A peer_limits
+    declare -A peer_stored_usage
+    if [[ -f "$DB_PATH" ]]; then
+        while IFS='|' read -r n lim stored; do
+            [[ -n "$lim" && "$lim" != "0" ]] && peer_limits["$n"]=$lim
+            peer_stored_usage["$n"]=${stored:-0}
+        done < <(sqlite3 "$DB_PATH" "SELECT name, data_limit_gb, (total_rx_bytes + total_tx_bytes) FROM peers;")
     fi
 
     # Output Result
-    # Unique sort names
     local sorted_names=$(printf "%s\n" "${peer_ids[@]}" | sort -u)
-    
-    # Get global mask for display normalization
     local g_mask=$(db_get_config "subnet_cidr" | cut -d/ -f2)
     [[ -z "$g_mask" ]] && g_mask="24"
 
@@ -1275,26 +1283,74 @@ scan_peers() {
         local src="${peer_map_src[$n]}"
         local status="UNKNOWN"
 
-        # Display Normalization: Show network mask instead of host mask
         local display_ip="$ip"
         if [[ "$display_ip" == *"/32" ]] || [[ "$display_ip" != *"/"* ]]; then
              display_ip="${display_ip%%/*}/${g_mask}"
         fi
 
         # Determine Status
+        local disabled=0
         if [[ "$src" == "DB" ]]; then
-            # DB knows best about "Disabled" state
-            status=$(sqlite3 "$DB_PATH" "SELECT CASE WHEN disabled=1 THEN 'DISABLED' ELSE 'ACTIVE' END FROM peers WHERE name='$n';" 2>/dev/null)
+            local db_st=$(sqlite3 "$DB_PATH" "SELECT disabled FROM peers WHERE name='$n';" 2>/dev/null)
+            [[ "$db_st" == "1" ]] && disabled=1
         elif [[ "$src" == "FILE" ]]; then 
-            # In file mode, check for marker file
-            if [[ -f "$INSTALL_DIR/clients/${n}.conf.disabled" ]]; then
-                status="DISABLED"
+            [[ -f "$INSTALL_DIR/clients/${n}.conf.disabled" ]] && disabled=1
+        fi
+        
+        # Check Limits
+        local is_over_limit=0
+        if [[ "${peer_limits[$n]}" ]]; then
+             local limit_bytes=$(( ${peer_limits[$n]} * 1024 * 1024 * 1024 ))
+             local stored=${peer_stored_usage[$n]}
+             local live=0
+             # Get pubkey to find live usage
+             local pub=$(db_query "SELECT public_key FROM peers WHERE name='$n';" 2>/dev/null)
+             if [[ -z "$pub" && -f "$client_dir/${n}.conf" ]]; then
+                 local priv=$(grep "PrivateKey" "$client_dir/${n}.conf" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+                 [[ -n "$priv" ]] && pub=$(echo "$priv" | wg pubkey 2>/dev/null)
+             fi
+             
+             if [[ -n "$pub" && -n "$transfer_dump" ]]; then
+                 local rx=0 tx=0
+                 # Use substring match to be safer or awk exact
+                 # transfer_dump is: pubkey rx tx
+                 local line=$(echo "$transfer_dump" | grep "$pub")
+                 if [[ -n "$line" ]]; then
+                    read -r _ rx tx <<< "$line"
+                 fi
+                 live=$((rx + tx))
+             fi
+             
+             if (( stored + live > limit_bytes )); then
+                 is_over_limit=1
+             fi
+        fi
+        
+        if [[ "$is_over_limit" == "1" ]]; then
+            status="OVER LIMIT"
+        elif [[ "$disabled" == "1" ]]; then
+            status="OFFLINE"
+        else
+            # If enabled, check for handshake
+            # Need pubkey (might have fetched above or fetch now)
+            [[ -z "$pub" ]] && pub=$(db_query "SELECT public_key FROM peers WHERE name='$n';" 2>/dev/null)
+            if [[ -z "$pub" && -f "$client_dir/${n}.conf" ]]; then
+                 local priv=$(grep "PrivateKey" "$client_dir/${n}.conf" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+                 [[ -n "$priv" ]] && pub=$(echo "$priv" | wg pubkey 2>/dev/null)
+            fi
+            
+            if [[ -n "$pub" ]] && echo "$active_pubs" | grep -q "$pub"; then
+                local ts=$(echo "$active_pubs" | grep "$pub" | awk '{print $2}')
+                if [[ "$ts" != "0" ]]; then 
+                    status="ONLINE ACTIVE"
+                else
+                    status="ACTIVE" 
+                fi
             else
-                status="ACTIVE"
+                 status="ACTIVE"
             fi
         fi
         
-        # Override with real handshake data if desired, or just print what we know
         echo "$n|$display_ip|$src|$status"
     done
 }
@@ -1621,14 +1677,45 @@ ensure_dependencies() {
                 
                 # Install core packages (xxd is usually in xxd or vim-common, openssl in openssl)
     # API Backend (Headless) requires Docker always
-    local core_pkgs="sqlite3 curl wireguard qrencode nftables cron xxd openssl inotify-tools"
+    local pkgs_to_install=()
+
+    # Check Core Packages
+    command -v sqlite3 &>/dev/null || pkgs_to_install+=("sqlite3")
+    command -v curl &>/dev/null || pkgs_to_install+=("curl")
+    command -v wg &>/dev/null || pkgs_to_install+=("wireguard")
+    command -v qrencode &>/dev/null || pkgs_to_install+=("qrencode")
+    command -v nft &>/dev/null || pkgs_to_install+=("nftables")
+    command -v crontab &>/dev/null || pkgs_to_install+=("cron")
+    command -v xxd &>/dev/null || pkgs_to_install+=("xxd")
+    command -v openssl &>/dev/null || pkgs_to_install+=("openssl")
+    command -v inotifywait &>/dev/null || pkgs_to_install+=("inotify-tools")
     
-    # Try plugin first, then legacy
-    if ! apt-get install -y $core_pkgs docker.io docker-compose-plugin; then
-        log_warn "docker-compose-plugin not found, trying docker-compose..."
-        if ! apt-get install -y $core_pkgs docker.io docker-compose; then
-            exit_with_error "Failed to install dependencies (Docker)."
+    # Check Docker (Only install if completely missing)
+    if ! command -v docker &>/dev/null; then
+        # Check if we should try plugin or legacy based on what's available in repo
+        # For now, just add the standard set if docker is missing
+        pkgs_to_install+=("docker.io" "docker-compose-plugin")
+    fi
+
+    if [[ ${#pkgs_to_install[@]} -gt 0 ]]; then
+        log_info "Installing missing packages: ${pkgs_to_install[*]}"
+        
+        # Try primary install
+        if ! apt-get install -y "${pkgs_to_install[@]}"; then
+             # If failed and docker was requested, retry with legacy docker-compose if plugin failed
+             if [[ " ${pkgs_to_install[*]} " =~ " docker-compose-plugin " ]]; then
+                 log_warn "Installation failed, retrying with legacy docker-compose..."
+                 # Replace plugin with legacy in the array (simple approximate fix for bash array)
+                 local legacy_pkgs=(${pkgs_to_install[@]/docker-compose-plugin/docker-compose})
+                 if ! apt-get install -y "${legacy_pkgs[@]}"; then
+                     exit_with_error "Failed to install dependencies."
+                 fi
+             else
+                 exit_with_error "Failed to install dependencies."
+             fi
         fi
+    else
+        log_success "All dependencies already installed."
     fi
                 
     log_success "Dependencies installed"
@@ -2167,7 +2254,7 @@ apply_firewall() {
     
     cat > /etc/nftables.conf <<EOF
 flush ruleset
-table inet filter {
+table inet samnet-filter {
     chain input {
         type filter hook input priority 0; policy drop;
         iifname "lo" accept
@@ -2186,7 +2273,7 @@ table inet filter {
         iifname "wg0" oifname "wg0" accept
     }
 }
-table ip nat {
+table ip samnet-nat {
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
         oifname "$wan_iface" masquerade
@@ -3002,7 +3089,13 @@ list_peers() {
         [[ "$s" == "ACTIVE" ]] && printf "  %-20s %-18s ${C_GREEN}%s${C_RESET}\n" "$n" "$ip" "$s" \
                                 || printf "  %-20s %-18s ${C_RED}%s${C_RESET}\n" "$n" "$ip" "$s"
     done
+
     wait_key
+}
+
+# Alias for menu compatibility
+list_peers_screen() {
+    list_peers
 }
 
 run_dry_validator() {
@@ -3689,16 +3782,8 @@ screen_peers() {
         fi
         local subnet_display=$(normalize_cidr "$raw_subnet")
         
-        local peer_count=0
-        # Prefer DB count (includes Web UI peers) over live WG count
-        if [[ -f "$DB_PATH" ]]; then
-            peer_count=$(db_query "SELECT COUNT(*) FROM peers;" 2>/dev/null)
-            [[ -z "$peer_count" ]] && peer_count=0
-        fi
-        # Fallback to live WG if DB returns 0 (for standalone mode)
-        if [[ "$peer_count" -eq 0 ]] && wg show wg0 &>/dev/null; then
-            peer_count=$(wg show wg0 | grep -c "peer:")
-        fi
+        # Consistent counting using unified source
+        local peer_count=$(scan_peers | grep -c .)
         
         printf "    ${T_CYAN}${T_BOLD}Network Status${T_RESET}\n"
         printf "    ${T_DIM}────────────────────────────────────────────${T_RESET}\n"
@@ -3717,6 +3802,7 @@ screen_peers() {
         menu_option "9" "Show QR Code" "Display config QR"
         menu_option "r" "Rename Peer" "Change peer name"
         menu_option "d" "Enable/Disable" "Toggle peer access"
+        menu_option "k" "Rotate Key / Repair" "Regenerate keys (Fix missing QR)"
         menu_option "m" "Maintenance" "Backup, Restore & Migration"
         printf "\n"
         menu_option "B" "Back" ""
@@ -3737,11 +3823,160 @@ screen_peers() {
             9) show_qr_wizard ;;
             r|R) rename_peer_wizard ;;
             d|D) toggle_peer_status_wizard ;;
+            k|K) rotate_peer_keys_wizard ;;
             m|M) screen_maintenance ;;
             "") ;; # Timeout - loop continues and refreshes
             b|B|$'\x1b') return ;;
         esac
     done
+}
+
+# Rotate Peer Keys Wizard
+rotate_peer_keys_wizard() {
+    ui_draw_header_mini "Rotate Peer Keys"
+    
+    printf "    ${T_CYAN}This will regenerate the private/public keys for a peer.${T_RESET}\n"
+    printf "    ${T_YELLOW}Use this ONLY if you lost the client config/QR code.${T_RESET}\n"
+    printf "    ${T_DIM}Note: The old connection will stop working immediately.${T_RESET}\n"
+    printf "    ${T_DIM}You MUST scan the NEW QR code on your device after this.${T_RESET}\n\n"
+
+    # Unified peer scan
+    local names=()
+    while IFS='|' read -r n ip src s; do
+        [[ -n "$n" ]] && names+=("$n")
+    done < <(scan_peers)
+    
+    if [[ ${#names[@]} -eq 0 ]]; then
+        log_warn "No peers found."
+        wait_key
+        return
+    fi
+    
+    printf "    ${T_GREEN}Select peer to repair:${T_RESET}\n"
+    local i=1
+    for n in "${names[@]}"; do
+        printf "    ${T_GREEN}[%d]${T_RESET} %s\n" "$i" "$n"
+        ((i++))
+    done
+    
+    local choice=$(ui_prompt "Select #")
+    [[ -z "$choice" ]] && return
+    
+    local idx=$((choice-1))
+    local target_name="${names[$idx]}"
+    
+    if [[ -z "$target_name" ]]; then log_error "Invalid selection"; return; fi
+    
+    if confirm "Regenerate keys for '$target_name'? (Will break existing connection)"; then
+        log_info "Rotating keys..."
+        
+        # 1. Generate new keys
+        local priv=$(wg genkey)
+        local pub=$(echo "$priv" | wg pubkey)
+        local enc_priv=$(encrypt_peer_key "$priv")
+        
+        # 2. Update DB
+        if [[ -f "$DB_PATH" ]]; then
+            db_exec "UPDATE peers SET public_key='$pub', encrypted_private_key='$enc_priv' WHERE name='$target_name';"
+        fi
+        
+        # 3. Update WireGuard Interface (Live)
+        # First remove old peer (needs old pubkey to remove, but simple rotate works by just setting new)
+        # Actually safer to remove old peer first if possible, but finding old pubkey might be hard if DB missing.
+        # Just writing to config and reloading is safest for persistence.
+        
+        # Remove old entry from wg0.conf
+        sed -i "/# $target_name/,/AllowedIPs/d" /etc/wireguard/wg0.conf
+        
+        # Get IP for this peer
+        local match_ip=""
+        if [[ -f "$DB_PATH" ]]; then
+            match_ip=$(db_query "SELECT allowed_ips FROM peers WHERE name='$target_name';")
+        fi
+        
+        # If IP missing from DB (rare), try to find it from old config backup or client file
+        if [[ -z "$match_ip" ]]; then
+             # Try client file
+             local cfile="$INSTALL_DIR/clients/${target_name}.conf"
+             if [[ -f "$cfile" ]]; then
+                 match_ip=$(grep "Address" "$cfile" | cut -d= -f2 | tr -d ' ')
+             fi
+        fi
+        
+        if [[ -z "$match_ip" ]]; then
+            log_error "Could not determine IP for peer. Cannot rotate."
+            wait_key
+            return
+        fi
+
+        local ip_short=$(echo "$match_ip" | cut -d/ -f1)
+        
+        # Add new entry to wg0.conf
+        echo "" >> /etc/wireguard/wg0.conf
+        echo "[Peer]" >> /etc/wireguard/wg0.conf
+        echo "# $target_name" >> /etc/wireguard/wg0.conf
+        echo "PublicKey = $pub" >> /etc/wireguard/wg0.conf
+        echo "AllowedIPs = $match_ip" >> /etc/wireguard/wg0.conf
+        
+        # Live reload
+        if command -v wg &>/dev/null; then
+            # Sync to interface: remove old (if we knew it) - actually, syncconf handles diffs!
+            # write_wg_conf handles full rewrite which is safer, let's just trigger sync
+            # But specific replace is:
+            # wg set wg0 peer <new_pub> allowed-ips <ip>
+            # (Old peer remains if not explicitly removed, but syncconf cleans it up)
+            
+            # Remove old peer from current interface using IP match is hard without pubkey.
+            # Best way: Reload full config.
+            write_wg_conf # Should regenerate clean config from DB/State
+            # But wait! write_wg_conf reads from DB. We updated DB. So it should work!
+            
+            # However, if we are in file mode, we just edited wg0.conf manually above.
+            # Let's trust wg syncconf or just "wg set" the new one.
+            wg set wg0 peer "$pub" allowed-ips "${ip_short}/32"
+        fi
+        
+        # 4. Regenerate Client Config
+        local client_conf="$INSTALL_DIR/clients/${target_name}.conf"
+        local server_pubkey=$(cat /etc/wireguard/publickey 2>/dev/null)
+        local server_port=$(grep "ListenPort" /etc/wireguard/wg0.conf | cut -d= -f2 | tr -d ' ')
+        
+        # Get endpoint
+        local custom_host=$(db_get_config "endpoint_hostname")
+        local server_endpoint=""
+        if [[ -n "$custom_host" ]]; then
+            server_endpoint="$custom_host"
+        else
+            server_endpoint=$(curl -4 -sf ifconfig.me 2>/dev/null || echo "YOUR_SERVER_IP")
+        fi
+
+        local mtu=$(db_get_config "mtu")
+        [[ -z "$mtu" ]] && mtu="1380"
+        local dns=$(db_get_config "dns_server")
+        [[ -z "$dns" ]] && dns="1.1.1.1, 8.8.8.8"
+
+        mkdir -p "$(dirname "$client_conf")"
+        cat <<EOF > "$client_conf"
+[Interface]
+PrivateKey = $priv
+Address = $match_ip
+DNS = $dns
+MTU = $mtu
+
+[Peer]
+PublicKey = $server_pubkey
+Endpoint = ${server_endpoint}:${server_port}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+        chmod 600 "$client_conf"
+        
+        log_success "Keys rotated! New QR code generated."
+        
+        printf "\n    ${T_CYAN}${T_BOLD}Scan New QR Code:${T_RESET}\n"
+        qrencode -t UTF8 -r "$client_conf" | less -R -K -P "Scan QR (Press Q to continue)"
+    fi
+    wait_key
 }
 
 # Rename Peer Wizard
@@ -3838,7 +4073,7 @@ toggle_peer_status_wizard() {
         [[ -z "$n" ]] && continue
         
         local is_disabled=0
-        [[ "$s" == "DISABLED" ]] && is_disabled=1
+        [[ "$s" == "DISABLED" || "$s" == "OFFLINE" || "$s" == "OVER LIMIT" ]] && is_disabled=1
         
         names+=("$n")
         ids+=("")
@@ -4060,18 +4295,25 @@ add_peer_wizard() {
     local server_pubkey=$(cat /etc/wireguard/publickey 2>/dev/null)
     local server_port=$(grep "ListenPort" /etc/wireguard/wg0.conf | cut -d= -f2 | tr -d ' ')
     # Detect Endpoint (Strict IPv4 Filter)
+    # Detect Endpoint (Strict IPv4 Filter)
     local custom_host=$(db_get_config "endpoint_hostname")
     local server_endpoint=""
     if [[ -n "$custom_host" ]]; then
         server_endpoint="$custom_host"
     else
-        server_endpoint=$(curl -4 -sf ifconfig.me 2>/dev/null || curl -4 -sf icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
+        # 1. Try saved WAN IP (Primary)
+        server_endpoint=$(db_get_config "wan_ip")
+        # 2. Try detection if missing
+        [[ -z "$server_endpoint" ]] && server_endpoint=$(detect_public_ip)
+        # 3. Fallback
+        [[ -z "$server_endpoint" ]] && server_endpoint="YOUR_SERVER_IP"
     fi
     
-    # Ensure it's a valid IPv4 address, otherwise fall back to asking user
-    if [[ ! "$server_endpoint" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-         # If detection failed or returned junk/IPv6, prompt user
-         server_endpoint=$(prompt "Public IPv4" "YOUR_SERVER_IP")
+    # Ensure it's a valid IPv4 address OR a valid domain name
+    if [[ ! "$server_endpoint" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && [[ ! "$server_endpoint" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+         # If detection failed or returned junk, prompt user
+         printf "    ${T_DIM}Press ENTER to accept the auto-detected IP/Domain.${T_RESET}\n"
+         server_endpoint=$(prompt "Public IPv4 or Domain" "YOUR_SERVER_IP")
     fi
     
     # Create clients directory if needed
@@ -4202,11 +4444,17 @@ add_temp_peer_wizard() {
     if [[ -n "$custom_host" ]]; then
         server_endpoint="$custom_host"
     else
-        server_endpoint=$(curl -4 -sf ifconfig.me 2>/dev/null || curl -4 -sf icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
+        # 1. Try saved WAN IP (Primary)
+        server_endpoint=$(db_get_config "wan_ip")
+        # 2. Try detection if missing
+        [[ -z "$server_endpoint" ]] && server_endpoint=$(detect_public_ip)
+        # 3. Fallback
+        [[ -z "$server_endpoint" ]] && server_endpoint="YOUR_SERVER_IP"
     fi
     
-    if [[ ! "$server_endpoint" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-         server_endpoint=$(prompt "Public IPv4" "YOUR_SERVER_IP")
+    if [[ ! "$server_endpoint" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && [[ ! "$server_endpoint" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+         printf "    ${T_DIM}Press ENTER to accept the auto-detected IP/Domain.${T_RESET}\n"
+         server_endpoint=$(prompt "Public IPv4 or Domain" "YOUR_SERVER_IP")
     fi
     
     local mtu=$(db_get_config "mtu")
@@ -4315,7 +4563,12 @@ add_bulk_peers_wizard() {
     if [[ -n "$custom_host" ]]; then
         server_endpoint="$custom_host"
     else
-        server_endpoint=$(curl -4 -sf ifconfig.me 2>/dev/null || echo "YOUR_SERVER_IP")
+        # 1. Try saved WAN IP (Primary)
+        server_endpoint=$(db_get_config "wan_ip")
+        # 2. Try detection if missing
+        [[ -z "$server_endpoint" ]] && server_endpoint=$(detect_public_ip)
+        # 3. Fallback
+        [[ -z "$server_endpoint" ]] && server_endpoint="YOUR_SERVER_IP"
     fi
     
     mkdir -p "$INSTALL_DIR/clients"
@@ -4906,9 +5159,9 @@ list_peers_screen() {
             return
         fi
 
-        # 1. Fetch all peers from DB
+        # 1. Fetch all peers from unified source
         local list
-        list=$(sqlite3 -batch "$DB_PATH" "SELECT name, allowed_ips FROM peers ORDER BY name ASC;" 2>/dev/null)
+        list=$(scan_peers)
         
         # Read into array
         local all_peers=()
@@ -4934,17 +5187,26 @@ list_peers_screen() {
         
         for (( idx=offset; idx<offset+page_size && idx<total_peers; idx++ )); do
             local line="${all_peers[$idx]}"
-            local name="${line%%|*}"
-            local ip="${line##*|}"
+            IFS='|' read -r name ip src status <<< "$line"
             
-            local status="${T_RED}OFFLINE${T_RESET}"
-            # Check if peer is known to WireGuard
-            local pubkey=$(db_query "SELECT public_key FROM peers WHERE name='$name';" | tr -d '[:space:]')
-            if [[ -n "$pubkey" ]] && wg show wg0 latest-handshakes | grep -F -q "$pubkey"; then
-                 status="${T_GREEN}ACTIVE${T_RESET}"
+            local status_display="${T_RED}OFFLINE${T_RESET}"
+            
+            if [[ "$status" == "ONLINE ACTIVE" ]]; then
+                 status_display="${T_GREEN}ONLINE${T_RESET}"
+            elif [[ "$status" == "ACTIVE" ]]; then
+                 status_display="${T_WHITE}ONLINE${T_RESET}"
+            elif [[ "$status" == "DISABLED" ]]; then
+                 status_display="${T_RED}OFFLINE${T_RESET}" 
+            elif [[ "$status" == "OFFLINE" ]]; then
+                 status_display="${T_RED}OFFLINE${T_RESET}"
+            elif [[ "$status" == "OVER LIMIT" ]]; then
+                 status_display="${T_RED}OVER LIMIT${T_RESET}"
             fi
             
-            printf "  ${T_CYAN}[%d]${T_RESET}  %-20s %-15s %b\n" "$i" "$name" "${ip%%/*}" "$status"
+            # Remove mask for cleaner display if it's /32
+            local short_ip="${ip%%/*}"
+            
+            printf "  ${T_CYAN}[%d]${T_RESET}  %-20s %-15s %b\n" "$i" "$name" "$short_ip" "$status_display"
             peers_map[$i]="$name"
             ((i++))
         done
@@ -6210,9 +6472,14 @@ full_uninstall() {
     rm -f /etc/wireguard/publickey && echo "  ✓ Public key removed"
     
     # Step 4: Firewall
-    log_info "[4/8] Removing firewall rules..."
-    nft flush ruleset 2>/dev/null && echo "  ✓ Rules flushed" || echo "  - No rules to flush"
-    rm -f /etc/nftables.conf && echo "  ✓ Config removed"
+    log_info "[4/8] Removing firewall rules (created by samnet)..."
+    # Remove only our specific tables to preserve user custom rules
+
+    nft delete table inet samnet-filter 2>/dev/null && echo "  ✓ Removed table inet samnet-filter" || echo "  - Table inet samnet-filter not found"
+    nft delete table ip samnet-nat 2>/dev/null && echo "  ✓ Removed table ip samnet-nat" || echo "  - Table ip samnet-nat not found"
+    # Legacy cleanup
+    nft delete table inet filter 2>/dev/null 2>&1
+    nft delete table ip nat 2>/dev/null 2>&1
     
     # Step 5: Database and data (samnet-wg specific paths)
     log_info "[5/8] Removing database and data..."
@@ -6316,6 +6583,193 @@ rebuild_docker() {
     log_success "Docker rebuild complete!"
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 13. MAINTENANCE & BACKUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+screen_maintenance() {
+    while true; do
+        ui_draw_header_mini "Maintenance & Backup"
+        
+        printf "    ${T_CYAN}Manage backups and perform system maintenance.${T_RESET}\n\n"
+        
+        menu_option "1" "Create Full Backup" "Save Configs, Keys, DB & Clients (Preserves QR!)"
+        menu_option "2" "Restore Backup" "Restore from .tar.gz file (No Key Gen needed)"
+        # menu_option "3" "Rotate Server Keys" "Regenerate Server Keypair (Advanced)"
+        # menu_option "4" "Prune Logs" "Clean up old logs"
+        printf "\n"
+        menu_option "B" "Back" ""
+        
+        ui_draw_footer "[1-2] Select  [B] Back"
+        printf "\n${T_CYAN}❯${T_RESET} "
+        
+        local key=$(read_key)
+        case "$key" in
+            1) create_backup_wizard ;;
+            2) restore_backup_wizard ;;
+            b|B|$'\x1b') return ;;
+        esac
+    done
+}
+
+create_backup_wizard() {
+    ui_draw_header_mini "Create Backup"
+    
+    log_info "This will create a comprehensive backup archive containing:"
+    echo "    • WireGuard keys and config (wg0.conf)"
+    echo "    • All client configurations (keys/QR codes)"
+    echo "    • SamNet Database (Metadata, Users, Logs)"
+    echo "    • Firewall Rules"
+    echo ""
+    echo "    ${T_GREEN}Why use this?${T_RESET}"
+    echo "    Restoring this backup later means you will NOT need to regenerate keys"
+    echo "    or rescan QR codes on your phones/laptops. It is a full state save."
+    echo ""
+    
+    if ! confirm "Create backup now?"; then return; fi
+    
+    local ts=$(date +%Y%m%d-%H%M%S)
+    local backup_dir="/root/samnet-backups"
+    local backup_file="$backup_dir/samnet-backup-$ts.tar.gz"
+    local tmp_dir=$(mktemp -d)
+    
+    mkdir -p "$backup_dir"
+    
+    log_info "Gathering files..."
+    
+    # 1. WireGuard Configs & Keys
+    mkdir -p "$tmp_dir/wireguard"
+    cp /etc/wireguard/wg0.conf "$tmp_dir/wireguard/" 2>/dev/null
+    cp /etc/wireguard/privatekey "$tmp_dir/wireguard/" 2>/dev/null
+    cp /etc/wireguard/publickey "$tmp_dir/wireguard/" 2>/dev/null
+    
+    # 2. Database & internal data
+    mkdir -p "$tmp_dir/data"
+    # Dump sqlite to be safe against corruption during copy
+    if [[ -f "$DB_PATH" ]]; then
+        sqlite3 "$DB_PATH" ".backup '$tmp_dir/data/samnet.db'"
+    fi
+    # Also copy file just in case
+    cp /var/lib/samnet-wg/*.key "$tmp_dir/data/" 2>/dev/null
+    
+    # 3. Client Configs (The critical part for User's request)
+    mkdir -p "$tmp_dir/clients"
+    cp -r "$INSTALL_DIR/clients/"* "$tmp_dir/clients/" 2>/dev/null
+    
+    # 4. Firewall
+    cp /etc/nftables.conf "$tmp_dir/nftables.conf" 2>/dev/null
+    
+    # 5. Metadata
+    echo "$VERSION" > "$tmp_dir/VERSION"
+    date > "$tmp_dir/DATE"
+    
+    log_info "Compressing..."
+    tar -czf "$backup_file" -C "$tmp_dir" .
+    rm -rf "$tmp_dir"
+    
+    log_success "Backup created successfully!"
+    echo "    Path: ${T_BOLD}${T_WHITE}$backup_file${T_RESET}"
+    echo ""
+    echo "    ${T_YELLOW}Keep this file safe! It contains your private keys.${T_RESET}"
+    wait_key
+}
+
+restore_backup_wizard() {
+    ui_draw_header_mini "Restore Backup"
+    
+    echo "    ${T_CYAN}This will restore your system state from a previous backup.${T_RESET}"
+    echo "    ${T_DIM}If the backup contains client files, your existing devices will"
+    echo "    connect immediately without needing new QR codes.${T_RESET}"
+    echo ""
+    
+    local backup_dir="/root/samnet-backups"
+    mkdir -p "$backup_dir"
+    
+    local files=("$backup_dir"/*.tar.gz)
+    if [[ ! -e "${files[0]}" ]]; then
+        log_warn "No backups found in $backup_dir"
+        echo "    You can upload a backup file here to restore it."
+        wait_key
+        return
+    fi
+    
+    echo "    ${T_CYAN}Select backup to restore:${T_RESET}"
+    local i=1
+    for f in "${files[@]}"; do
+        printf "    ${T_GREEN}[%d]${T_RESET} %s\n" "$i" "$(basename "$f")"
+        ((i++))
+    done
+    
+    local choice=$(ui_prompt "Select #")
+    [[ -z "$choice" ]] && return
+    
+    local idx=$((choice-1))
+    local target_file="${files[$idx]}"
+    
+    if [[ ! -f "$target_file" ]]; then log_error "Invalid selection"; return; fi
+    
+    echo ""
+    log_warn "${T_RED}WARNING: This will OVERWRITE current configuration!${T_RESET}"
+    if ! confirm "Proceed with restore?"; then return; fi
+    
+    local tmp_dir=$(mktemp -d)
+    log_info "Extracting..."
+    tar -xzf "$target_file" -C "$tmp_dir"
+    
+    # Function to restore safe permissions
+    restore_perms() {
+        chown -R root:root /etc/wireguard
+        chmod 600 /etc/wireguard/wg0.conf /etc/wireguard/privatekey
+        mkdir -p "$INSTALL_DIR/clients"
+        chown -R 1000:1000 "$INSTALL_DIR/clients"
+        chmod 700 "$INSTALL_DIR/clients"
+        mkdir -p "/var/lib/samnet-wg"
+        chown -R 1000:1000 "/var/lib/samnet-wg"
+    }
+
+    log_info "Restoring components..."
+    
+    # Stop services
+    systemctl stop wg-quick@wg0 2>/dev/null
+    
+    # 1. WireGuard
+    if [[ -d "$tmp_dir/wireguard" ]]; then
+        cp "$tmp_dir/wireguard/"* /etc/wireguard/
+    fi
+    
+    # 2. Data/DB
+    if [[ -d "$tmp_dir/data" ]]; then
+        cp "$tmp_dir/data/"* /var/lib/samnet-wg/
+        # Ensure correct ownership for Docker API
+        chown -R 1000:1000 /var/lib/samnet-wg
+    fi
+    
+    # 3. Clients
+    if [[ -d "$tmp_dir/clients" ]]; then
+        mkdir -p "$INSTALL_DIR/clients"
+        cp -r "$tmp_dir/clients/"* "$INSTALL_DIR/clients/"
+    fi
+    
+    # 4. Firewall
+    if [[ -f "$tmp_dir/nftables.conf" ]]; then
+        cp "$tmp_dir/nftables.conf" /etc/nftables.conf
+        nft -f /etc/nftables.conf 2>/dev/null
+    fi
+    
+    restore_perms
+    
+    # Restart Services
+    log_info "Restarting services..."
+    systemctl start wg-quick@wg0
+    docker restart samnet-wg-api 2>/dev/null
+    
+    rm -rf "$tmp_dir"
+    
+    log_success "Restore complete!"
+    echo "    Your peers, keys, and configurations have been restored."
+    wait_key
+}
+
 trap 'cleanup_exit 130' INT
 trap 'cleanup_exit 143' TERM
 
@@ -6378,7 +6832,7 @@ main() {
     fi
     
     # API status
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q samnet-api; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "samnet(-wg)?-api"; then
         if curl -sf --max-time 2 $(get_api_url)/health/live &>/dev/null; then
             echo "  ${T_GREEN}●${T_RESET} API          ${T_GREEN}healthy${T_RESET}"
         else
