@@ -2285,6 +2285,29 @@ EOF
         systemctl enable nftables
         log_success "Firewall rules applied"
         rm -f "$backup"
+        
+        # ─── Docker/iptables Compatibility ───────────────────────────────────────
+        # Docker uses iptables with its own FORWARD chain (policy DROP).
+        # nftables rules exist in a separate namespace and don't affect iptables.
+        # When both coexist, iptables blocks wg0 traffic even if nftables allows it.
+        # Solution: Add iptables rules to allow wg0 forwarding when Docker is present.
+        if command -v docker &>/dev/null && iptables -L FORWARD -n 2>/dev/null | grep -q "DOCKER"; then
+            log_info "Docker detected - adding iptables compatibility rules for wg0"
+            
+            # Remove any existing wg0 rules to avoid duplicates
+            iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            
+            # Insert at the beginning of FORWARD chain (before Docker rules)
+            iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT
+            iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+            
+            # Also add NAT masquerade for wg0 traffic in iptables (Docker's nat table)
+            iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null || true
+            iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE
+            
+            log_success "iptables compatibility rules added for Docker coexistence"
+        fi
     else
         log_error "Firewall failed, rolling back..."
         nft -f "$backup" 2>/dev/null
@@ -3880,11 +3903,6 @@ rotate_peer_keys_wizard() {
             db_exec "UPDATE peers SET public_key='$pub', encrypted_private_key='$enc_priv' WHERE name='$target_name';"
         fi
         
-        # 3. Update WireGuard Interface (Live)
-        # First remove old peer (needs old pubkey to remove, but simple rotate works by just setting new)
-        # Actually safer to remove old peer first if possible, but finding old pubkey might be hard if DB missing.
-        # Just writing to config and reloading is safest for persistence.
-        
         # Remove old entry from wg0.conf
         sed -i "/# $target_name/,/AllowedIPs/d" /etc/wireguard/wg0.conf
         
@@ -3920,19 +3938,6 @@ rotate_peer_keys_wizard() {
         
         # Live reload
         if command -v wg &>/dev/null; then
-            # Sync to interface: remove old (if we knew it) - actually, syncconf handles diffs!
-            # write_wg_conf handles full rewrite which is safer, let's just trigger sync
-            # But specific replace is:
-            # wg set wg0 peer <new_pub> allowed-ips <ip>
-            # (Old peer remains if not explicitly removed, but syncconf cleans it up)
-            
-            # Remove old peer from current interface using IP match is hard without pubkey.
-            # Best way: Reload full config.
-            write_wg_conf # Should regenerate clean config from DB/State
-            # But wait! write_wg_conf reads from DB. We updated DB. So it should work!
-            
-            # However, if we are in file mode, we just edited wg0.conf manually above.
-            # Let's trust wg syncconf or just "wg set" the new one.
             wg set wg0 peer "$pub" allowed-ips "${ip_short}/32"
         fi
         
@@ -6477,9 +6482,18 @@ full_uninstall() {
 
     nft delete table inet samnet-filter 2>/dev/null && echo "  ✓ Removed table inet samnet-filter" || echo "  - Table inet samnet-filter not found"
     nft delete table ip samnet-nat 2>/dev/null && echo "  ✓ Removed table ip samnet-nat" || echo "  - Table ip samnet-nat not found"
-    # Legacy cleanup
-    nft delete table inet filter 2>/dev/null 2>&1
-    nft delete table ip nat 2>/dev/null 2>&1
+    
+    # Clean up iptables rules added for Docker compatibility (wg0 forwarding)
+    # These are safe to remove - they only affect wg0 traffic
+    local wan_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    if [[ -n "$wan_iface" ]]; then
+        iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null && echo "  ✓ Removed iptables wg0 forward rule"
+        iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null && echo "  ✓ Removed iptables wg0 return rule"
+        iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null && echo "  ✓ Removed iptables wg0 NAT rule"
+    fi
+    
+    # NOTE: We deliberately do NOT delete generic tables like 'inet filter' or 'ip nat'
+    # as these may be used by Docker or other services. Only samnet-specific tables are removed.
     
     # Step 5: Database and data (samnet-wg specific paths)
     log_info "[5/8] Removing database and data..."
@@ -6490,11 +6504,12 @@ full_uninstall() {
     rm -rf /var/log/samnet-wg && echo "  ✓ Log directory removed"
     rm -rf /var/log/samnet 2>/dev/null || true
     
-    # Step 6: Cron jobs (remove both samnet-wg and legacy samnet patterns)
+    # Step 6: Cron jobs (remove ONLY samnet-wg specific patterns, preserve other samnet projects)
     log_info "[6/8] Removing cron jobs..."
     if crontab -l &>/dev/null; then
-        crontab -l | grep -v "samnet-wg-ui" | grep -v "samnet-ui" | grep -v "bandwidth_collector" | grep -v "samnet check_expiry" | crontab -
-        echo "  ✓ Cron jobs removed"
+        # Use precise patterns to avoid removing other samnet project cron jobs
+        crontab -l | grep -v "samnet-wg" | grep -v "/opt/samnet/.*bandwidth_collector" | grep -v "samnet\.sh check_expiry" | crontab -
+        echo "  ✓ Cron jobs removed (samnet-wg only)"
     fi
     
     # Step 7: Installed files
