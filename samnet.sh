@@ -1,7 +1,7 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
 # SamNet-WG Unified Manager, Installer & CLI/TUI
-# Version: 1.
+# Version: 1.0.2
 # Author: Sam Hesami | samnet.dev
 # License: MIT
 #
@@ -21,7 +21,7 @@ export LC_ALL=C.UTF-8
 # 1. GLOBAL CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-readonly SAMNET_VERSION="1.0.1"
+readonly SAMNET_VERSION="1.0.2"
 readonly APP_NAME="SamNet-WG"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1671,8 +1671,22 @@ ensure_dependencies() {
         if [[ -f /etc/os-release ]]; then
             source /etc/os-release
             if [[ "$ID" =~ ^(debian|ubuntu|raspbian)$ ]]; then
-                if ! apt-get update -qq; then
-                     exit_with_error "Failed to update package lists. Check internet connection."
+                # Check connectivity before updating app lists
+                if ping -c 1 -W 1 8.8.8.8 &>/dev/null || curl -s --connect-timeout 2 https://1.1.1.1 >/dev/null; then
+                     log_info "Updating package lists..."
+                     if ! timeout 20s apt-get update -qq; then
+                          log_warn "Package update timed out or failed. Continuing..."
+                     fi
+                else
+                     log_warn "No internet connection. Skipping package list update."
+                     # If we are missing packages and offline, we must fail
+                     if [[ ${#pkgs_to_install[@]} -gt 0 ]]; then
+                         # Check if we can proceed anyway (maybe apt cache is good enough?)
+                         # Try simulating install
+                         if ! apt-get -s install "${pkgs_to_install[@]}" &>/dev/null; then
+                             exit_with_error "Missing dependencies: ${pkgs_to_install[*]} but system is offline. Connect to internet or install manually."
+                         fi
+                     fi
                 fi
                 
                 # Install core packages (xxd is usually in xxd or vim-common, openssl in openssl)
@@ -1905,8 +1919,8 @@ ListenPort = $port
 PrivateKey = $privkey
 MTU = $mtu
 SaveConfig = false
-PostUp = nft -f /etc/nftables.conf
-PostDown = nft delete table inet samnet-filter 2>/dev/null; nft delete table ip samnet-nat 2>/dev/null || true
+PostUp = nft -f /etc/nftables.conf; [[ -f /etc/samnet-ports.nft ]] && nft -f /etc/samnet-ports.nft || true
+PostDown = nft delete table inet samnet-filter 2>/dev/null; nft delete table ip samnet-nat 2>/dev/null; nft delete table ip6 samnet-nat6 2>/dev/null || true
 
 # Disable IPv6 for this interface specifically to avoid leaks
 # (Though OS-level disable is better, this is safe per-interface)
@@ -2242,7 +2256,6 @@ ensure_wg_up() {
 apply_firewall() {
     local wan_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
     local port=$(db_get_config "listen_port")
-    # Fail-safe: Default to 51820 if DB is empty to prevent syntax errors
     port="${port:-51820}"
     
     validate_interface "$wan_iface" || { log_error "Invalid WAN interface"; return 1; }
@@ -2252,28 +2265,36 @@ apply_firewall() {
     
     modprobe nft_chain_nat_ipv4 2>/dev/null || true
     
-    # Pre-clean our tables (Safe - do not flush ruleset)
+    # Get firewall mode (default: samnet-managed)
+    local firewall_mode=$(db_get_config "firewall_mode")
+    firewall_mode="${firewall_mode:-samnet}"
+    
+    # Always clean up our tables first
     nft delete table inet samnet-filter 2>/dev/null || true
     nft delete table ip samnet-nat 2>/dev/null || true
+    nft delete table ip6 samnet-nat6 2>/dev/null || true
     
-    cat > /etc/nftables.conf <<EOF
+    # ─── Mode-specific firewall setup ───
+    if [[ "$firewall_mode" == "samnet" ]]; then
+        # Full samnet firewall management (filter + nat)
+        cat > /etc/nftables.conf <<EOF
 table inet samnet-filter {
     chain input {
-        type filter hook input priority 0; policy drop;
+        type filter hook input priority 0; policy accept;
         iifname "lo" accept
         iifname "wg0" accept
         ct state established,related accept
-        ip protocol icmp accept
-        udp dport $port accept
-        tcp dport 22 accept
-        tcp dport 80 accept
-        tcp dport 443 accept
     }
     chain forward {
-        type filter hook forward priority 0; policy drop;
+        type filter hook forward priority 10; policy accept;
+        # Allow established/related traffic (most common case, handles return traffic)
+        ct state established,related accept
+        # WireGuard VPN traffic
         iifname "$wan_iface" oifname "wg0" ct state established,related accept
         iifname "wg0" oifname "$wan_iface" accept
         iifname "wg0" oifname "wg0" accept
+        # Docker bridge traffic is already handled by Docker's own rules at priority 0
+        # We run at priority 10 (after Docker) with policy accept, so we don't interfere
     }
 }
 table ip samnet-nat {
@@ -2282,60 +2303,347 @@ table ip samnet-nat {
         oifname "$wan_iface" masquerade
     }
 }
+table ip6 samnet-nat6 {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "$wan_iface" masquerade
+    }
+}
 EOF
-    
-    if nft -f /etc/nftables.conf; then
-        systemctl enable nftables
-        log_success "Firewall rules applied via nftables"
-        rm -f "$backup"
-        
-        # ─── Docker/iptables Compatibility ───────────────────────────────────────
-        # Docker uses iptables with its own FORWARD chain (policy DROP).
-        # We need to insert rules into iptables to allow traffic, AND persist them.
-        if command -v docker &>/dev/null || [[ -n "$(iptables -L FORWARD -n 2>/dev/null | grep DOCKER)" ]]; then
-            if iptables -L FORWARD -n 2>/dev/null | grep -q "DOCKER"; then
-                log_info "Docker detected - ensuring iptables compatibility settings..."
-                
-                # Remove any existing wg0 rules to avoid duplicates
-                iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null || true
-                iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-                
-                # Insert at the beginning of FORWARD chain (before Docker rules)
-                iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT
-                iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
-                
-                # Also add NAT masquerade for wg0 traffic in iptables (Docker's nat table)
-                iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null || true
-                iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE
-                
-                log_success "iptables compatibility rules active"
-
-                # Persistence
-                if ! command -v netfilter-persistent &>/dev/null; then
-                     log_info "Installing iptables-persistent..."
-                     export DEBIAN_FRONTEND=noninteractive
-                     apt-get update -qq &>/dev/null
-                     echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-                     echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-                     apt-get install -y -qq iptables-persistent &>/dev/null
-                fi
-                
-                if command -v netfilter-persistent &>/dev/null; then
-                    netfilter-persistent save >/dev/null 2>&1
-                fi
-            fi
-        fi
     else
+        # External firewall mode (UFW/iptables) - only NAT rules for VPN, no filter
+        # UFW/Docker manage their own filtering, we just add masquerading for VPN traffic
+        cat > /etc/nftables.conf <<EOF
+# SamNet VPN NAT rules only (firewall managed externally)
+table ip samnet-nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "$wan_iface" masquerade
+    }
+}
+table ip6 samnet-nat6 {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "$wan_iface" masquerade
+    }
+}
+EOF
+    fi
+    
+    if ! nft -f /etc/nftables.conf; then
         log_error "Firewall failed, rolling back..."
         nft -f "$backup" 2>/dev/null
         rm -f "$backup"
         return 1
     fi
+    
+    rm -f "$backup"
+    
+    # ─── Step 2: Handle user ports table based on firewall mode ───
+    if [[ "$firewall_mode" == "samnet" ]]; then
+        # Only create samnet-ports if it doesn't exist (first install)
+        if ! nft list table inet samnet-ports &>/dev/null; then
+            create_samnet_ports_table "$port"
+        else
+            # Table exists - just ensure VPN port is current
+            update_vpn_port_rule "$port"
+        fi
+        # Load persisted rules if they exist
+        [[ -f /etc/samnet-ports.nft ]] && nft -f /etc/samnet-ports.nft 2>/dev/null || true
+    else
+        # If not in SamNet mode, ensure we remove our managed table so it doesn't block traffic
+        nft delete table inet samnet-ports 2>/dev/null || true
+    fi
+    
+    systemctl enable nftables 2>/dev/null || true
+    log_success "Firewall rules applied (mode: $firewall_mode)"
+    
+    # ─── Docker/iptables Compatibility ───────────────────────────────────────
+    if command -v docker &>/dev/null || [[ -n "$(iptables -L FORWARD -n 2>/dev/null | grep DOCKER)" ]]; then
+        if iptables -L FORWARD -n 2>/dev/null | grep -q "DOCKER"; then
+            log_info "Docker detected - ensuring iptables compatibility..."
+            
+            iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT
+            iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+            
+            iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null || true
+            iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE
+            
+            if ! command -v netfilter-persistent &>/dev/null; then
+                 log_info "Installing iptables-persistent..."
+                 export DEBIAN_FRONTEND=noninteractive
+                 apt-get update -qq &>/dev/null
+                 echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+                 echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+                 apt-get install -y -qq iptables-persistent &>/dev/null
+            fi
+            
+            command -v netfilter-persistent &>/dev/null && netfilter-persistent save >/dev/null 2>&1
+        fi
+    fi
+}
+
+# ─── User Ports Table Management ─────────────────────────────────────────────
+
+create_samnet_ports_table() {
+    local vpn_port="${1:-51820}"
+    
+    log_info "Creating firewall with secure defaults + service detection..."
+    
+    # Detect running services on common ports
+    local detected_ports=""
+    local common_ports="80 443 8080 8443 3000 9090 9100 3306 5432 6379 27017 25 587 993 995"
+    
+    for port in $common_ports; do
+        if ss -tlnH 2>/dev/null | grep -qE ":${port}\s"; then
+            detected_ports="$detected_ports $port"
+        fi
+    done
+    
+    # Build the dynamic port rules
+    local port_rules=""
+    for port in $detected_ports; do
+        case $port in
+            80)   port_rules="${port_rules}        tcp dport 80 accept comment \"http-detected\"\n" ;;
+            443)  port_rules="${port_rules}        tcp dport 443 accept comment \"https-detected\"\n" ;;
+            8080) port_rules="${port_rules}        tcp dport 8080 accept comment \"alt-http-detected\"\n" ;;
+            8443) port_rules="${port_rules}        tcp dport 8443 accept comment \"alt-https-detected\"\n" ;;
+            3000) port_rules="${port_rules}        tcp dport 3000 accept comment \"grafana-detected\"\n" ;;
+            9090) port_rules="${port_rules}        tcp dport 9090 accept comment \"prometheus-detected\"\n" ;;
+            9100) port_rules="${port_rules}        tcp dport 9100 accept comment \"node-exporter-detected\"\n" ;;
+            3306) port_rules="${port_rules}        tcp dport 3306 accept comment \"mysql-detected\"\n" ;;
+            5432) port_rules="${port_rules}        tcp dport 5432 accept comment \"postgres-detected\"\n" ;;
+            6379) port_rules="${port_rules}        tcp dport 6379 accept comment \"redis-detected\"\n" ;;
+            27017) port_rules="${port_rules}        tcp dport 27017 accept comment \"mongodb-detected\"\n" ;;
+            25)   port_rules="${port_rules}        tcp dport 25 accept comment \"smtp-detected\"\n" ;;
+            587)  port_rules="${port_rules}        tcp dport 587 accept comment \"submission-detected\"\n" ;;
+            993)  port_rules="${port_rules}        tcp dport 993 accept comment \"imaps-detected\"\n" ;;
+            995)  port_rules="${port_rules}        tcp dport 995 accept comment \"pop3s-detected\"\n" ;;
+        esac
+    done
+    
+    if [[ -n "$detected_ports" ]]; then
+        log_info "Auto-detected services:$detected_ports"
+    fi
+    
+    # Using 'inet' family covers both IPv4 and IPv6
+    # Priority -10 ensures this runs before standard filter chains
+    nft -f - <<EOF
+table inet samnet-ports {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        
+        # Core System Rules
+        iifname "lo" accept comment "allow-loopback"
+        ct state established,related accept comment "allow-return-traffic"
+        
+        # Docker Compatibility - allow all traffic from Docker bridges
+        iifname "docker0" accept comment "docker-bridge"
+        iifname "br-*" accept comment "docker-custom-networks"
+        
+        # Protocols
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+        
+        # Required Ports
+        udp dport $vpn_port accept comment "wireguard-vpn"
+        tcp dport 22 accept comment "ssh"
+$(echo -e "$port_rules")
+    }
+}
+EOF
+    
+    persist_samnet_ports
+    
+    local count=$(echo "$detected_ports" | wc -w)
+    log_success "Firewall created: SSH + VPN + Docker + $count detected services"
+}
+
+update_vpn_port_rule() {
+    local new_port="$1"
+    
+    # Remove old VPN port rule if exists
+    local old_handle=$(nft -a list chain inet samnet-ports input 2>/dev/null | \
+                       grep 'comment "wireguard-vpn"' | grep -oP 'handle \K[0-9]+')
+    [[ -n "$old_handle" ]] && nft delete rule inet samnet-ports input handle "$old_handle" 2>/dev/null
+    
+    # Add new VPN port rule at the beginning (after icmp)
+    nft insert rule inet samnet-ports input udp dport "$new_port" accept comment '"wireguard-vpn"' 2>/dev/null || true
+    persist_samnet_ports
+}
+
+persist_samnet_ports() {
+    nft list table inet samnet-ports > /etc/samnet-ports.nft 2>/dev/null || true
+    chmod 600 /etc/samnet-ports.nft 2>/dev/null || true
+}
+
+add_firewall_port() {
+    local port="$1"
+    local proto="${2:-tcp}"
+    local label="${3:-user-defined}"
+    
+    # Validate port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        log_error "Invalid port number: $port"
+        return 1
+    fi
+    
+    # Validate protocol
+    if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+        log_error "Invalid protocol: $proto (must be tcp or udp)"
+        return 1
+    fi
+    
+    # Check firewall mode
+    local firewall_mode=$(db_get_config "firewall_mode")
+    if [[ "$firewall_mode" != "samnet" ]]; then
+        log_error "Cannot add ports - firewall is in '$firewall_mode' mode"
+        log_info "Change to 'samnet' mode or use your external firewall tool"
+        return 1
+    fi
+    
+    # Ensure table exists
+    if ! nft list table inet samnet-ports &>/dev/null; then
+        log_error "Ports table doesn't exist. Run install first."
+        return 1
+    fi
+    
+    # Check if already exists
+    if nft list chain inet samnet-ports input 2>/dev/null | grep -q "$proto dport $port "; then
+        log_warn "Port $port/$proto is already open"
+        return 0
+    fi
+    
+    # Add rule
+    nft add rule inet samnet-ports input "$proto" dport "$port" accept comment "\"$label\""
+    persist_samnet_ports
+    
+    log_success "Opened port $port/$proto ($label)"
+}
+
+remove_firewall_port() {
+    local port="$1"
+    local proto="${2:-tcp}"
+    
+    local vpn_port=$(db_get_config "listen_port")
+    vpn_port="${vpn_port:-51820}"
+    
+    # Prevent removing VPN port
+    if [[ "$port" == "$vpn_port" && "$proto" == "udp" ]]; then
+        log_error "Cannot remove VPN port - this would break WireGuard"
+        return 1
+    fi
+    
+    # Prevent removing SSH (with warning)
+    if [[ "$port" == "22" && "$proto" == "tcp" ]]; then
+        log_warn "Removing SSH port 22 - make sure you have alternative access!"
+    fi
+    
+    # Find and remove rule by handle
+    local handle=$(nft -a list chain inet samnet-ports input 2>/dev/null | \
+                   grep "$proto dport $port " | grep -oP 'handle \K[0-9]+' | head -1)
+    
+    if [[ -z "$handle" ]]; then
+        log_warn "Port $port/$proto not found in firewall rules"
+        return 1
+    fi
+    
+    nft delete rule inet samnet-ports input handle "$handle"
+    persist_samnet_ports
+    
+    log_success "Closed port $port/$proto"
+}
+
+list_firewall_ports() {
+    local firewall_mode=$(db_get_config "firewall_mode")
+    
+    if [[ "$firewall_mode" != "samnet" ]]; then
+        echo "Firewall mode: $firewall_mode (ports managed externally)"
+        return 0
+    fi
+    
+    if ! nft list table inet samnet-ports &>/dev/null; then
+        echo "No ports table found"
+        return 1
+    fi
+    
+    # Parse and display ports
+    nft list chain inet samnet-ports input 2>/dev/null | \
+        grep -E "(tcp|udp) dport" | \
+        sed 's/.*\(tcp\|udp\) dport \([0-9]*\).*/\2\/\1/' | \
+        while read port_proto; do
+            local comment=$(nft list chain inet samnet-ports input 2>/dev/null | \
+                           grep "$port_proto" | grep -oP 'comment "\K[^"]+' || echo "")
+            echo "$port_proto  $comment"
+        done
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. INSTALLATION ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
+
+run_preflight_checks() {
+    log_info "Running pre-flight checks..."
+    local failed=0
+    
+    # 1. Port Availability Checks (Fast)
+    if ss -tuln 2>/dev/null | grep -q ":80 " && [[ "$(db_get_config web_ui_enabled)" == "true" ]]; then
+        log_warn "Port 80 in use (Web UI might fail)"
+    fi
+    if ss -tuln 2>/dev/null | grep -q ":8080 "; then
+        log_warn "Port 8080 in use"
+    fi
+    
+    # 2. Internet Connectivity (Ultra Fast)
+    # Strategy: Ping first (sub-second usually), fallback to HTTP head check
+    local connected=false
+    
+    if ping -c 1 -W 1 8.8.8.8 &>/dev/null || ping -c 1 -W 1 1.1.1.1 &>/dev/null; then
+        connected=true
+    elif curl -s --head --connect-timeout 2 https://1.1.1.1 &>/dev/null; then
+        connected=true
+    fi
+    
+    if [[ "$connected" == "false" ]]; then
+         log_warn "No internet connectivity detected (or blocked)"
+    fi
+    
+    # 3. Kernel Modules
+    if ! modprobe wireguard 2>/dev/null; then
+         # Try to see if it's built-in
+         if [[ ! -d /sys/module/wireguard ]]; then
+             log_warn "WireGuard kernel module not loaded (will attempt to install)"
+         fi
+    fi
+
+    log_success "Pre-flight checks passed"
+    return 0
+}
+
+# Optimized IP Detection (Fast & Robust)
+detect_public_ip() {
+    local ip=""
+    # Parallel-ish attempt with fast failovers
+    ip=$(curl -s --connect-timeout 2 http://ifconfig.me)
+    [[ -z "$ip" ]] && ip=$(curl -s --connect-timeout 2 https://api.ipify.org)
+    [[ -z "$ip" ]] && ip=$(curl -s --connect-timeout 2 https://icanhazip.com)
+    
+    # Validation
+    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "$ip"
+    else
+        # Fallback: Use local interface IP (Robustness for partial connectivity)
+        local local_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
+        if [[ "$local_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            # log_warn "Using local IP as fallback" >&2
+            echo "$local_ip"
+        else
+            echo ""
+        fi
+    fi
+}
 
 do_install() {
     check_root
@@ -2371,6 +2679,29 @@ do_install() {
         [[ -n "$detected_ip" ]] && db_set_config "wan_ip" "$detected_ip"
         db_set_config "listen_port" "51820"
         db_set_config "subnet_cidr" "10.100.0.0/24"
+        
+        # Smart firewall detection for zero-touch mode
+        # If existing firewall detected, use external mode to avoid conflicts
+        local detected_firewall="none"
+        
+        # Check for UFW
+        if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+            detected_firewall="ufw"
+        # Check for iptables with non-default rules (more than just ACCEPT policies)
+        elif iptables -L INPUT -n 2>/dev/null | grep -qE "^(DROP|REJECT|ACCEPT.*dpt:)"; then
+            detected_firewall="iptables"
+        # Check for nftables with existing filter tables (excluding samnet's own)
+        elif nft list tables 2>/dev/null | grep -qE "filter|firewall" && ! nft list tables 2>/dev/null | grep -q "samnet"; then
+            detected_firewall="nftables"
+        fi
+        
+        if [[ "$detected_firewall" != "none" ]]; then
+            log_info "Detected existing firewall: $detected_firewall - using external mode"
+            db_set_config "firewall_mode" "external"
+        else
+            log_info "No existing firewall detected - using SamNet managed mode"
+            db_set_config "firewall_mode" "samnet"
+        fi
     fi
     
     # Get Web UI preference
@@ -2406,15 +2737,27 @@ do_install() {
         chmod 750 /var/lib/samnet-wg
         
         # Fix DNS for Docker builds (Docker uses its own DNS, not host's)
+        # Fix DNS for Docker builds (Docker uses its own DNS, not host's)
+        # We explicitly check for reliable resolvers (8.8.8.8 or 1.1.1.1)
+        # If not found, we BACKUP existing config and FORCE our working config.
+        # This fixes the common "lookup registry-1.docker.io: i/o timeout" error.
         log_info "Configuring Docker DNS for reliable builds..."
         mkdir -p /etc/docker
+        
+        local update_dns=false
         if [[ ! -f /etc/docker/daemon.json ]]; then
-            echo '{"dns": ["8.8.8.8", "1.1.1.1"]}' > /etc/docker/daemon.json
-        elif ! grep -q '"dns"' /etc/docker/daemon.json; then
-            # Add DNS to existing config (simple append for JSON object)
-            sed -i 's/}$/,"dns": ["8.8.8.8", "1.1.1.1"]}/' /etc/docker/daemon.json
+            update_dns=true
+        elif ! grep -qE "8\.8\.8\.8|1\.1\.1\.1" /etc/docker/daemon.json; then
+            log_warn "Existing Docker DNS config may be unreliable. Overwriting..."
+            cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+            update_dns=true
         fi
-        systemctl restart docker 2>/dev/null || true
+        
+        if [[ "$update_dns" == "true" ]]; then
+            echo '{"dns": ["8.8.8.8", "1.1.1.1"]}' > /etc/docker/daemon.json
+            systemctl restart docker 2>/dev/null || true
+            sleep 3 # Give it a moment to bind
+        fi
         
         # Wait for Docker to be ready (up to 30 seconds)
         local docker_wait=0
@@ -2727,7 +3070,7 @@ run_install_wizard() {
     
     while true; do
         show_banner
-        printf "  ${C_DIM}Step %d of 5${C_RESET}\n" "$step"
+        printf "  ${C_DIM}Step %d of 6${C_RESET}\n" "$step"
         
         case $step in
             1)
@@ -2812,17 +3155,25 @@ run_install_wizard() {
                 esac
                 ;;
             4)
+                if ! run_firewall_mode_wizard; then
+                    ((step--))
+                else
+                    ((step++))
+                fi
+                ;;
+            5)
                 section "Subnet Selection"
                 run_subnet_wizard
                 [[ -n "$WIZARD_SUBNET" ]] && { db_set_config "subnet_cidr" "$WIZARD_SUBNET"; ((step++)); } || ((step--))
                 ;;
-            5)
+            6)
                 section "Review & Apply"
                 draw_box "Configuration" \
-                    "WAN IP:  $(db_get_config wan_ip)" \
-                    "Port:    $(db_get_config listen_port)" \
-                    "Subnet:  $(db_get_config subnet_cidr)" \
-                    "Web UI:  $(db_get_config web_ui_enabled)"
+                    "WAN IP:    $(db_get_config wan_ip)" \
+                    "Port:      $(db_get_config listen_port)" \
+                    "Web UI:    $(db_get_config web_ui_enabled)" \
+                    "Firewall:  $(db_get_config firewall_mode)" \
+                    "Subnet:    $(db_get_config subnet_cidr)"
                 
                 menu_option "A" "Apply" ""
                 menu_option "B" "Back" ""
@@ -2837,6 +3188,63 @@ run_install_wizard() {
                 ;;
         esac
     done
+}
+
+run_firewall_mode_wizard() {
+    section "Firewall Configuration"
+    
+    printf "  ${C_BOLD}How would you like to manage firewall ports?${C_RESET}\n\n"
+    
+    menu_option "1" "SamNet Managed (Recommended)" "SamNet controls ports via TUI"
+    menu_option "2" "External Firewall (UFW/iptables)" "You manage ports with UFW"
+    menu_option "3" "No Firewall Management" "SamNet touches nothing"
+    menu_option "B" "Back" ""
+    
+    printf "\n${C_CYAN}❯${C_RESET} "
+    local c=$(read_key)
+    
+    case "${c^^}" in
+        1)
+            # Check if switching FROM external mode - warn about potential lockout
+            local current_mode=$(db_get_config "firewall_mode")
+            if [[ "$current_mode" == "external" || "$current_mode" == "none" ]]; then
+                echo ""
+                log_warn "Switching to SamNet Managed mode"
+                echo ""
+                echo "  ${T_CYAN}What happens:${T_RESET}"
+                echo "    • SSH (22) and WireGuard VPN will be open"
+                echo "    • Docker bridge traffic will be allowed"
+                echo "    • Running services will be auto-detected and whitelisted"
+                echo "      (ports: 80, 443, 3000, 9090, databases, etc.)"
+                echo ""
+                echo "  ${T_YELLOW}Note:${T_RESET} Your existing UFW/iptables rules will NOT be migrated."
+                echo "  You can add/remove ports anytime via: Security & Access → Firewall Ports"
+                echo ""
+                read -r -p "  Continue with auto-detection? (yes/no): " confirm
+                if [[ "${confirm,,}" != "yes" ]]; then
+                    log_info "Cancelled. Keeping current mode: $current_mode"
+                    return 1
+                fi
+            fi
+            db_set_config "firewall_mode" "samnet"
+            log_success "Selected: SamNet Managed"
+            return 0
+            ;;
+        2)
+            db_set_config "firewall_mode" "external"
+            log_success "Selected: External Firewall"
+            return 0
+            ;;
+        3)
+            db_set_config "firewall_mode" "none"
+            log_success "Selected: No Management"
+            return 0
+            ;;
+        B) return 1 ;;
+        *)
+            run_firewall_mode_wizard
+            ;;
+    esac
 }
 
 run_subnet_wizard() {
@@ -2972,6 +3380,7 @@ screen_security() {
         menu_option "1" "Secrets Health" ""
         menu_option "2" "Audit Log" ""
         menu_option "3" "Rotate Token" ""
+        menu_option "4" "Firewall Ports" "Add/remove open ports"
         menu_option "B" "Back" ""
         
         printf "\n${C_CYAN}❯${C_RESET} "
@@ -2980,8 +3389,108 @@ screen_security() {
             1) secrets_health ;;
             2) view_audit ;;
             3) rotate_token ;;
+            4) screen_firewall_ports ;;
             B|G) return ;;
             Q) cleanup_exit 0 ;;
+        esac
+    done
+}
+
+screen_firewall_ports() {
+    while true; do
+        show_banner
+        section "Firewall Ports"
+        
+        local mode=$(db_get_config "firewall_mode")
+        printf "  ${T_DIM}Current mode: ${T_RESET}${C_CYAN}%s${C_RESET}\n\n" "${mode:-not set}"
+        
+        if [[ "$mode" != "samnet" ]]; then
+            log_warn "Firewall is in '$mode' mode - use your external firewall tool"
+            log_info "Change to 'samnet' mode to manage ports here"
+            echo ""
+            menu_option "M" "Change Mode" ""
+            menu_option "B" "Back" ""
+            printf "\n${C_CYAN}❯${C_RESET} "
+            local c=$(read_key)
+            case "${c^^}" in
+                M) run_firewall_mode_wizard && apply_firewall ;;
+                B|Q) return ;;
+            esac
+            continue
+        fi
+        
+        menu_option "1" "List Open Ports" ""
+        menu_option "2" "Add Port" ""
+        menu_option "3" "Remove Port" ""
+        menu_option "M" "Change Mode" ""
+        menu_option "B" "Back" ""
+        
+        printf "\n${C_CYAN}❯${C_RESET} "
+        local c=$(read_key)
+        case "${c^^}" in
+            1)
+                echo ""
+                list_firewall_ports
+                wait_key
+                ;;
+            2)
+                echo ""
+                read -r -p "  Port number: " port
+                [[ -z "$port" ]] && continue
+                
+                echo ""
+                echo "  ${C_BOLD}Protocol:${C_RESET}"
+                menu_option "1" "TCP" "(default)"
+                menu_option "2" "UDP" ""
+                menu_option "3" "Both" ""
+                printf "\n  ${C_CYAN}❯${C_RESET} "
+                local proto_choice=$(read_key)
+                
+                case "$proto_choice" in
+                    1|"") 
+                        add_firewall_port "$port" "tcp"
+                        ;;
+                    2)
+                        add_firewall_port "$port" "udp"
+                        ;;
+                    3)
+                        add_firewall_port "$port" "tcp"
+                        add_firewall_port "$port" "udp"
+                        ;;
+                esac
+                wait_key
+                ;;
+            3)
+                echo ""
+                read -r -p "  Port to remove: " port
+                [[ -z "$port" ]] && continue
+                
+                echo ""
+                echo "  ${C_BOLD}Protocol:${C_RESET}"
+                menu_option "1" "TCP" "(default)"
+                menu_option "2" "UDP" ""
+                menu_option "3" "Both" ""
+                printf "\n  ${C_CYAN}❯${C_RESET} "
+                local proto_choice=$(read_key)
+                
+                case "$proto_choice" in
+                    1|"") 
+                        remove_firewall_port "$port" "tcp"
+                        ;;
+                    2)
+                        remove_firewall_port "$port" "udp"
+                        ;;
+                    3)
+                        remove_firewall_port "$port" "tcp"
+                        remove_firewall_port "$port" "udp"
+                        ;;
+                esac
+                wait_key
+                ;;
+            M)
+                run_firewall_mode_wizard && apply_firewall
+                ;;
+            B|Q) return ;;
         esac
     done
 }
@@ -3337,6 +3846,12 @@ export_diagnostics_bundle() {
     # Firewall
     nft list ruleset > "$tmpdir/firewall.txt" 2>/dev/null
     
+    # Firewall mode and ports config
+    echo "firewall_mode=$(db_get_config firewall_mode)" > "$tmpdir/firewall_config.txt"
+    echo "listen_port=$(db_get_config listen_port)" >> "$tmpdir/firewall_config.txt"
+    [[ -f /etc/samnet-ports.nft ]] && cp /etc/samnet-ports.nft "$tmpdir/samnet-ports.nft"
+    [[ -f /etc/nftables.conf ]] && cp /etc/nftables.conf "$tmpdir/nftables.conf"
+    
     # Services
     systemctl status wg-quick@wg0 > "$tmpdir/wg-status.txt" 2>/dev/null
     docker ps -a > "$tmpdir/docker.txt" 2>/dev/null
@@ -3389,6 +3904,14 @@ run_troubleshooter() {
         issues+=("FW|NAT rules missing|nft -f /etc/nftables.conf")
     fi
     
+    # Check firewall mode consistency
+    local fw_mode=$(db_get_config "firewall_mode")
+    if [[ "$fw_mode" == "samnet" ]]; then
+        if ! nft list table inet samnet-ports &>/dev/null; then
+            issues+=("FW|samnet-ports table missing|samnet --apply-firewall")
+        fi
+    fi
+    
     # Check Docker
     if ! systemctl is-active --quiet docker; then
         issues+=("DOCKER|Docker not running|systemctl start docker")
@@ -3396,7 +3919,7 @@ run_troubleshooter() {
     
     # Check API
     if ! curl -sf $(get_api_url)/health/live &>/dev/null; then
-        issues+=("API|API not responding|docker restart samnet-api")
+        issues+=("API|API not responding|docker restart samnet-wg-api")
     fi
     
     # Check DNS
@@ -3442,32 +3965,47 @@ firewall_diff_viewer() {
     local snap_id=$(date +%s | tail -c 5)
     printf "  ${C_DIM}Snapshot ID: %s${C_RESET}\n\n" "$snap_id"
     
+    # Show firewall mode
+    local mode=$(db_get_config "firewall_mode")
+    printf "  ${C_BOLD}Firewall Mode:${C_RESET} ${C_CYAN}%s${C_RESET}\n\n" "${mode:-not set}"
+    
     log_info "Comparing planned vs applied rules..."
     printf "\n"
     
     # Get current applied rules
     local applied=$(nft list ruleset 2>/dev/null)
     
-    # Get planned rules (from config file)
-    local planned=""
-    [[ -f /etc/nftables.conf ]] && planned=$(cat /etc/nftables.conf)
-    
-    printf "  ${C_BOLD}Applied Rules Summary:${C_RESET}\n"
-    echo "$applied" | grep -E "(chain|accept|drop|masquerade)" | head -15 | while read line; do
+    printf "  ${C_BOLD}Applied Tables:${C_RESET}\n"
+    nft list tables 2>/dev/null | while read line; do
         printf "  ${C_DIM}│${C_RESET} %s\n" "$line"
     done
     
-    printf "\n  ${C_BOLD}Config File (/etc/nftables.conf):${C_RESET}\n"
+    printf "\n  ${C_BOLD}Config Files:${C_RESET}\n"
     if [[ -f /etc/nftables.conf ]]; then
-        printf "  ${C_GREEN}●${C_RESET} Present (%d bytes)\n" "$(wc -c < /etc/nftables.conf)"
+        printf "  ${C_GREEN}●${C_RESET} /etc/nftables.conf (%d bytes)\n" "$(wc -c < /etc/nftables.conf)"
     else
-        printf "  ${C_RED}●${C_RESET} Missing!\n"
+        printf "  ${C_RED}●${C_RESET} /etc/nftables.conf - Missing!\n"
     fi
     
-    # Check if they match
-    if nft -c -f /etc/nftables.conf &>/dev/null; then
-        printf "\n  ${C_GREEN}✔${C_RESET} Config syntax valid\n"
+    if [[ -f /etc/samnet-ports.nft ]]; then
+        printf "  ${C_GREEN}●${C_RESET} /etc/samnet-ports.nft (%d bytes)\n" "$(wc -c < /etc/samnet-ports.nft)"
     else
+        printf "  ${C_DIM}●${C_RESET} /etc/samnet-ports.nft - Not created\n"
+    fi
+    
+    # Show open ports if in samnet mode
+    if [[ "$mode" == "samnet" ]] && nft list table inet samnet-ports &>/dev/null; then
+        printf "\n  ${C_BOLD}Open Ports (samnet-ports):${C_RESET}\n"
+        nft list chain inet samnet-ports input 2>/dev/null | \
+            grep -E "(tcp|udp) dport" | head -10 | while read line; do
+                printf "  ${C_DIM}│${C_RESET} %s\n" "$line"
+            done
+    fi
+    
+    # Check syntax
+    if [[ -f /etc/nftables.conf ]] && nft -c -f /etc/nftables.conf &>/dev/null; then
+        printf "\n  ${C_GREEN}✔${C_RESET} Config syntax valid\n"
+    elif [[ -f /etc/nftables.conf ]]; then
         printf "\n  ${C_RED}✘${C_RESET} Config has syntax errors\n"
     fi
     
@@ -5691,31 +6229,614 @@ screen_security() {
     while true; do
         ui_draw_header_mini "Security & Access"
         
-        menu_option "1" "Firewall Status" "View nftables rules"
-        menu_option "2" "Regenerate Server Keys" "New WireGuard keypair"
-        menu_option "3" "View Logs" "System and API logs"
+        menu_option "1" "Firewall Ports" "Manage open ports (add/remove)"
+        menu_option "2" "Firewall Status" "View all nftables rules"
+        menu_option "3" "Regenerate Server Keys" "New WireGuard keypair"
+        menu_option "4" "View Logs" "System and API logs"
         printf "\n"
         menu_option "B" "Back" ""
         
-        ui_draw_footer "[1-3] Select  [B] Back"
+        ui_draw_footer "[1-4] Select  [B] Back"
         printf "\n${T_CYAN}❯${T_RESET} "
         
         local key=$(read_key)
         case "$key" in
-            1) show_firewall_status ;;
-            2) log_warn "Not implemented yet"; wait_key ;;
-            3) show_logs_screen ;;
+            1) screen_firewall_ports ;;
+            2) show_firewall_status ;;
+            3) log_warn "Not implemented yet"; wait_key ;;
+            4) show_logs_screen ;;
             b|B|$'\x1b') return ;;
         esac
     done
 }
 
-# Show Firewall Status
+# ─── Firewall Port Management Screen ─────────────────────────────────────────
+
+screen_firewall_ports() {
+    while true; do
+        ui_draw_header_mini "Firewall Port Manager"
+        
+        local firewall_mode=$(db_get_config "firewall_mode")
+        # Smart default: if UFW is active, default to external mode
+        if [[ -z "$firewall_mode" ]]; then
+            if ufw status 2>/dev/null | grep -q "Status: active"; then
+                firewall_mode="external"
+            else
+                firewall_mode="samnet"
+            fi
+        fi
+        local vpn_port=$(db_get_config "listen_port")
+        vpn_port="${vpn_port:-51820}"
+        
+        # Mode indicator
+        case "$firewall_mode" in
+            samnet)
+                printf "  ${T_GREEN}●${T_RESET} Mode: ${T_BOLD}SamNet Managed${T_RESET}\n"
+                printf "  ${T_DIM}Open ports are controlled by this TUI. Don't use UFW/iptables.${T_RESET}\n\n"
+                ;;
+            external)
+                printf "  ${T_YELLOW}●${T_RESET} Mode: ${T_BOLD}External Firewall${T_RESET}\n"
+                printf "  ${T_DIM}Ports are managed by UFW/iptables. SamNet only handles VPN routing.${T_RESET}\n\n"
+                printf "  ${T_YELLOW}To manage ports, use your external firewall tool.${T_RESET}\n\n"
+                menu_option "V" "View Rules" "Show all active firewall rules"
+                menu_option "M" "Change Mode" "Switch to SamNet-managed"
+                menu_option "B" "Back" ""
+                ui_draw_footer "[V] View Rules  [M] Change Mode  [B] Back"
+                printf "\n${T_CYAN}❯${T_RESET} "
+                local key=$(read_key)
+                case "$key" in
+                    v|V) show_firewall_rules_table ;;
+                    m|M) run_firewall_mode_wizard ;;
+                    b|B|$'\x1b') return ;;
+                esac
+                continue
+                ;;
+            none)
+                printf "  ${T_RED}●${T_RESET} Mode: ${T_BOLD}No Firewall${T_RESET}\n"
+                printf "  ${T_DIM}All ports are open. Use with caution!${T_RESET}\n\n"
+                menu_option "V" "View Rules" "Show all active firewall rules"
+                menu_option "M" "Change Mode" "Enable firewall protection"
+                menu_option "B" "Back" ""
+                ui_draw_footer "[V] View Rules  [M] Change Mode  [B] Back"
+                printf "\n${T_CYAN}❯${T_RESET} "
+                local key=$(read_key)
+                case "$key" in
+                    v|V) show_firewall_rules_table ;;
+                    m|M) run_firewall_mode_wizard ;;
+                    b|B|$'\x1b') return ;;
+                esac
+                continue
+                ;;
+        esac
+        
+        # List open ports
+        printf "  ${T_BOLD}Open Ports:${T_RESET}\n"
+        printf "  ${T_DIM}────────────────────────────────────────────${T_RESET}\n"
+        
+        if nft list table inet samnet-ports &>/dev/null; then
+            local port_num=1
+            nft list chain inet samnet-ports input 2>/dev/null | grep -E "(tcp|udp) dport" | while read line; do
+                local proto=$(echo "$line" | grep -oP '(tcp|udp)')
+                local port=$(echo "$line" | grep -oP 'dport \K[0-9]+')
+                local comment=$(echo "$line" | grep -oP 'comment "\K[^"]+' || echo "")
+                
+                local status="${T_GREEN}[OPEN]${T_RESET}"
+                local locked=""
+                
+                # Mark VPN port as locked
+                if [[ "$port" == "$vpn_port" && "$proto" == "udp" ]]; then
+                    status="${T_CYAN}[VPN]${T_RESET}"
+                    locked=" ${T_DIM}(locked)${T_RESET}"
+                fi
+                
+                # Format nicely
+                printf "  ${T_CYAN}%2d.${T_RESET} %-6s %-5s %-20s %s%s\n" \
+                    "$port_num" "$port" "$proto" "${comment:-user-defined}" "$status" "$locked"
+                ((port_num++))
+            done
+        else
+            printf "  ${T_DIM}No ports table found. Run install first.${T_RESET}\n"
+        fi
+        
+        printf "\n"
+        menu_option "V" "View Rules" "Show all active firewall rules"
+        menu_option "A" "Add Port" "Open a new port"
+        menu_option "R" "Remove Port" "Close a port"
+        menu_option "P" "Presets" "Quick port templates"
+        menu_option "M" "Change Mode" "Switch firewall mode"
+        menu_option "B" "Back" ""
+        
+        ui_draw_footer "[V]iew  [A]dd  [R]emove  [P]resets  [M]ode  [B]ack"
+        printf "\n${T_CYAN}❯${T_RESET} "
+        
+        local key=$(read_key)
+        case "$key" in
+            v|V) show_firewall_rules_table ;;
+            a|A) firewall_add_port_wizard ;;
+            r|R) firewall_remove_port_wizard ;;
+            p|P) firewall_presets_menu ;;
+            m|M) run_firewall_mode_wizard ;;
+            b|B|$'\x1b') return ;;
+        esac
+    done
+}
+
+firewall_add_port_wizard() {
+    ui_draw_header_mini "Add Firewall Port"
+    
+    printf "  Enter port details:\n\n"
+    
+    # Port number
+    printf "  Port number (1-65535): "
+    read -r port_input
+    
+    if ! [[ "$port_input" =~ ^[0-9]+$ ]] || [[ "$port_input" -lt 1 ]] || [[ "$port_input" -gt 65535 ]]; then
+        log_error "Invalid port number"
+        wait_key
+        return
+    fi
+    
+    # Protocol
+    printf "  Protocol [tcp/udp] (default: tcp): "
+    read -r proto_input
+    proto_input="${proto_input:-tcp}"
+    
+    if [[ "$proto_input" != "tcp" && "$proto_input" != "udp" ]]; then
+        log_error "Invalid protocol. Must be 'tcp' or 'udp'"
+        wait_key
+        return
+    fi
+    
+    # Label
+    printf "  Label (optional, e.g., 'web-server'): "
+    read -r label_input
+    label_input="${label_input:-user-defined}"
+    
+    # Confirm
+    printf "\n  Adding: ${T_BOLD}$port_input/$proto_input${T_RESET} ($label_input)\n"
+    printf "  Continue? [Y/n]: "
+    read -r confirm
+    
+    if [[ "${confirm,,}" != "n" ]]; then
+        add_firewall_port "$port_input" "$proto_input" "$label_input"
+    else
+        log_info "Cancelled"
+    fi
+    wait_key
+}
+
+firewall_remove_port_wizard() {
+    ui_draw_header_mini "Remove Firewall Port"
+    
+    local vpn_port=$(db_get_config "listen_port")
+    vpn_port="${vpn_port:-51820}"
+    
+    printf "  Enter port to close:\n\n"
+    
+    # Port number
+    printf "  Port number: "
+    read -r port_input
+    
+    # Protocol
+    printf "  Protocol [tcp/udp] (default: tcp): "
+    read -r proto_input
+    proto_input="${proto_input:-tcp}"
+    
+    # Safety check for SSH
+    if [[ "$port_input" == "22" && "$proto_input" == "tcp" ]]; then
+        printf "\n  ${T_RED}${T_BOLD}WARNING:${T_RESET} Removing SSH port will lock you out!\n"
+        printf "  Are you SURE? Type 'YES' to confirm: "
+        read -r ssh_confirm
+        if [[ "$ssh_confirm" != "YES" ]]; then
+            log_info "Cancelled"
+            wait_key
+            return
+        fi
+    fi
+    
+    remove_firewall_port "$port_input" "$proto_input"
+    wait_key
+}
+
+firewall_presets_menu() {
+    ui_draw_header_mini "Firewall Presets"
+    
+    printf "  Quick port configurations:\n\n"
+    
+    menu_option "1" "Minimal" "SSH only (port 22)"
+    menu_option "2" "Web Server" "SSH + HTTP + HTTPS (22, 80, 443)"
+    menu_option "3" "Web + Honeypot" "SSH + HTTP + HTTPS + 2222"
+    menu_option "4" "Development" "SSH + common dev ports (22, 3000, 8080)"
+    printf "\n"
+    menu_option "B" "Back" ""
+    
+    ui_draw_footer "[1-4] Apply preset  [B] Back"
+    printf "\n${T_CYAN}❯${T_RESET} "
+    
+    local key=$(read_key)
+    case "$key" in
+        1) apply_firewall_preset "minimal" ;;
+        2) apply_firewall_preset "webserver" ;;
+        3) apply_firewall_preset "webhoneypot" ;;
+        4) apply_firewall_preset "development" ;;
+        b|B|$'\x1b') return ;;
+    esac
+}
+
+apply_firewall_preset() {
+    local preset="$1"
+    local vpn_port=$(db_get_config "listen_port")
+    vpn_port="${vpn_port:-51820}"
+    
+    printf "\n  ${T_YELLOW}This will reset your ports to the preset. Continue? [y/N]: ${T_RESET}"
+    read -r confirm
+    
+    if [[ "${confirm,,}" != "y" ]]; then
+        log_info "Cancelled"
+        wait_key
+        return
+    fi
+    
+    # Delete and recreate ports table with preset
+    nft delete table inet samnet-ports 2>/dev/null || true
+    
+    case "$preset" in
+        minimal)
+            nft -f - <<EOF
+table inet samnet-ports {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        ip protocol icmp accept
+        udp dport $vpn_port accept comment "wireguard-vpn"
+        tcp dport 22 accept comment "ssh"
+    }
+}
+EOF
+            log_success "Applied 'Minimal' preset (SSH + VPN only)"
+            ;;
+        webserver)
+            nft -f - <<EOF
+table inet samnet-ports {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        ip protocol icmp accept
+        udp dport $vpn_port accept comment "wireguard-vpn"
+        tcp dport 22 accept comment "ssh"
+        tcp dport 80 accept comment "http"
+        tcp dport 443 accept comment "https"
+    }
+}
+EOF
+            log_success "Applied 'Web Server' preset (SSH + HTTP + HTTPS)"
+            ;;
+        webhoneypot)
+            nft -f - <<EOF
+table inet samnet-ports {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        ip protocol icmp accept
+        udp dport $vpn_port accept comment "wireguard-vpn"
+        tcp dport 22 accept comment "ssh"
+        tcp dport 80 accept comment "http"
+        tcp dport 443 accept comment "https"
+        tcp dport 2222 accept comment "honeypot"
+    }
+}
+EOF
+            log_success "Applied 'Web + Honeypot' preset"
+            ;;
+        development)
+            nft -f - <<EOF
+table inet samnet-ports {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        ip protocol icmp accept
+        udp dport $vpn_port accept comment "wireguard-vpn"
+        tcp dport 22 accept comment "ssh"
+        tcp dport 3000 accept comment "dev-server"
+        tcp dport 8080 accept comment "alt-http"
+    }
+}
+EOF
+            log_success "Applied 'Development' preset"
+            ;;
+    esac
+    
+    persist_samnet_ports
+    wait_key
+}
+
+run_firewall_mode_wizard() {
+    ui_draw_header_mini "Firewall Mode Selection"
+    
+    # Detect existing firewalls
+    local detected=""
+    if systemctl is-active --quiet ufw 2>/dev/null; then
+        detected="UFW (active)"
+    elif command -v ufw &>/dev/null; then
+        detected="UFW (installed)"
+    fi
+    if iptables -L INPUT -n 2>/dev/null | grep -qE "DROP|REJECT" && [[ -z "$detected" ]]; then
+        detected="${detected:+$detected, }iptables rules detected"
+    fi
+    
+    if [[ -n "$detected" ]]; then
+        printf "  ${T_YELLOW}Detected: $detected${T_RESET}\n\n"
+    fi
+    
+    local current_mode=$(db_get_config "firewall_mode")
+    # Smart default: if UFW is active and no mode set, default to external
+    if [[ -z "$current_mode" ]]; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            current_mode="external"
+        else
+            current_mode="samnet"
+        fi
+    fi
+    printf "  Current mode: ${T_BOLD}$current_mode${T_RESET}\n\n"
+    
+    printf "  ${T_BOLD}Select firewall mode:${T_RESET}\n\n"
+    
+    menu_option "1" "SamNet Managed" "Control ports via this TUI"
+    printf "      ${T_DIM}├─ Secure by default (policy: drop)${T_RESET}\n"
+    printf "      ${T_DIM}└─ ⚠ Don't use UFW/iptables for ports${T_RESET}\n\n"
+    
+    menu_option "2" "External Firewall" "You manage ports externally"
+    printf "      ${T_DIM}├─ SamNet only handles VPN routing${T_RESET}\n"
+    printf "      ${T_DIM}└─ Use UFW, iptables, etc. for ports${T_RESET}\n\n"
+    
+    menu_option "3" "No Firewall" "All ports open (dangerous)"
+    printf "      ${T_DIM}└─ Not recommended for production${T_RESET}\n\n"
+    
+    menu_option "B" "Back" "Keep current mode"
+    
+    ui_draw_footer "[1-3] Select mode  [B] Back"
+    printf "\n${T_CYAN}❯${T_RESET} "
+    
+    local key=$(read_key)
+    case "$key" in
+        1)
+            # ─── Safety Check: WireGuard must be installed ───
+            if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+                printf "\n  ${T_RED}${T_BOLD}Cannot select SamNet Managed mode!${T_RESET}\n"
+                printf "  ${T_YELLOW}WireGuard is not installed.${T_RESET}\n\n"
+                printf "  SamNet Managed mode requires WireGuard to be installed first.\n"
+                printf "  This prevents accidentally overwriting your existing firewall rules.\n\n"
+                printf "  ${T_DIM}Options:${T_RESET}\n"
+                printf "  ${T_DIM}  • Run installer: ${T_CYAN}samnet --zero-touch${T_RESET}\n"
+                printf "  ${T_DIM}  • Use External Firewall mode with UFW/iptables${T_RESET}\n"
+                wait_key
+                return
+            fi
+            
+            # ─── Smart Switch to SamNet Mode ───
+            local vpn_port=$(db_get_config "listen_port")
+            vpn_port="${vpn_port:-51820}"
+            
+            # Check if samnet-ports exists
+            if ! nft list table inet samnet-ports &>/dev/null; then
+                # Detect listening services that need ports opened
+                printf "\n  ${T_CYAN}Scanning for listening services...${T_RESET}\n"
+                
+                local detected_ports=()
+                local detected_procs=()
+                
+                # Scan common ports using ss
+                if command -v ss &>/dev/null; then
+                    while read -r port proc; do
+                        [[ -n "$port" ]] && detected_ports+=("$port") && detected_procs+=("$proc")
+                    done < <(ss -tlnp 2>/dev/null | grep LISTEN | awk '{
+                        port = $4; sub(/.*:/, "", port);
+                        proc = $6; gsub(/.*"/, "", proc); gsub(/".*/, "", proc);
+                        if (port ~ /^[0-9]+$/ && port != "22") print port, proc
+                    }' | head -15)
+                fi
+                
+                # Filter to well-known ports that users likely want open
+                local ports_to_add=()
+                local labels=()
+                
+                for i in "${!detected_ports[@]}"; do
+                    local p="${detected_ports[$i]}"
+                    local proc="${detected_procs[$i]}"
+                    case "$p" in
+                        80)   ports_to_add+=("80:tcp"); labels+=("http ($proc)") ;;
+                        443)  ports_to_add+=("443:tcp"); labels+=("https ($proc)") ;;
+                        2222) ports_to_add+=("2222:tcp"); labels+=("alt-ssh/honeypot ($proc)") ;;
+                        3000) ports_to_add+=("3000:tcp"); labels+=("dev-server ($proc)") ;;
+                        8080) ports_to_add+=("8080:tcp"); labels+=("alt-http ($proc)") ;;
+                        8443) ports_to_add+=("8443:tcp"); labels+=("alt-https ($proc)") ;;
+                        8081|8082) ports_to_add+=("$p:tcp"); labels+=("docker-proxy ($proc)") ;;
+                    esac
+                done
+                
+                if [[ ${#ports_to_add[@]} -gt 0 ]]; then
+                    printf "\n  ${T_YELLOW}⚠ Detected services that need open ports:${T_RESET}\n\n"
+                    for i in "${!ports_to_add[@]}"; do
+                        local port_proto="${ports_to_add[$i]}"
+                        local label="${labels[$i]}"
+                        printf "    ${T_GREEN}•${T_RESET} %-10s %s\n" "${port_proto%:*}/tcp" "$label"
+                    done
+                    printf "\n  ${T_CYAN}Without these ports, services will be blocked!${T_RESET}\n"
+                    printf "  Add detected ports to firewall? [Y/n]: "
+                    read -r add_confirm
+                    
+                    if [[ "${add_confirm,,}" != "n" ]]; then
+                        # Create samnet-ports with detected services
+                        local nft_rules="table inet samnet-ports {\n    chain input {\n        type filter hook input priority -10; policy drop;\n        ip protocol icmp accept\n        udp dport $vpn_port accept comment \"wireguard-vpn\"\n        tcp dport 22 accept comment \"ssh\"\n"
+                        
+                        for i in "${!ports_to_add[@]}"; do
+                            local port_proto="${ports_to_add[$i]}"
+                            local port="${port_proto%:*}"
+                            local proto="${port_proto#*:}"
+                            local label="${labels[$i]%% (*}"  # Remove process name
+                            nft_rules+="        $proto dport $port accept comment \"$label\"\n"
+                        done
+                        
+                        nft_rules+="    }\n}\n"
+                        
+                        echo -e "$nft_rules" | nft -f -
+                        persist_samnet_ports
+                        log_success "Created firewall with ${#ports_to_add[@]} detected ports + SSH + VPN"
+                    else
+                        # User declined - create minimal
+                        create_samnet_ports_table "$vpn_port"
+                        log_warn "Created minimal firewall (SSH + VPN only)"
+                    fi
+                else
+                    # No services detected - create minimal
+                    create_samnet_ports_table "$vpn_port"
+                    log_success "Created firewall with SSH + VPN"
+                fi
+            else
+                log_info "Using existing samnet-ports table"
+            fi
+            
+            db_set_config "firewall_mode" "samnet"
+            log_success "Switched to SamNet-managed firewall"
+            ;;
+        2)
+            db_set_config "firewall_mode" "external"
+            # Remove samnet-ports table to avoid conflicts
+            if nft list table inet samnet-ports &>/dev/null; then
+                printf "\n  ${T_YELLOW}Remove samnet-ports table? (recommended to avoid conflicts) [Y/n]: ${T_RESET}"
+                read -r remove_confirm
+                if [[ "${remove_confirm,,}" != "n" ]]; then
+                    nft delete table inet samnet-ports 2>/dev/null
+                    rm -f /etc/samnet-ports.nft
+                    log_info "Removed samnet-ports table"
+                fi
+            fi
+            log_success "Switched to external firewall mode"
+            log_info "Remember to open necessary ports with your firewall tool!"
+            ;;
+        3)
+            printf "\n  ${T_RED}${T_BOLD}WARNING:${T_RESET} No firewall means ALL ports are open!\n"
+            printf "  Type 'CONFIRM' to proceed: "
+            read -r confirm
+            if [[ "$confirm" == "CONFIRM" ]]; then
+                db_set_config "firewall_mode" "none"
+                nft delete table inet samnet-ports 2>/dev/null
+                rm -f /etc/samnet-ports.nft
+                log_warn "Firewall disabled - all ports open"
+            else
+                log_info "Cancelled"
+            fi
+            ;;
+        b|B|$'\x1b') return ;;
+    esac
+    wait_key
+}
+
+# ─── Show All Active Firewall Rules in Table Format ──────────────────────────
+
+show_firewall_rules_table() {
+    # Collect all output into a variable so we can pipe to less
+    local output=""
+    local current_table=""
+    
+    output+="  ${T_BOLD}Open ports from all firewall sources:${T_RESET}\n\n"
+    output+="  ${T_CYAN}PORT     PROTO   SOURCE             ACTION${T_RESET}\n"
+    output+="  ${T_DIM}──────────────────────────────────────────────────────${T_RESET}\n"
+    
+    # ─── 1. Scan nftables (only samnet/honeypot tables, skip UFW internal) ───
+    if command -v nft &>/dev/null; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^table[[:space:]]+(inet|ip|ip6)[[:space:]]+([a-zA-Z0-9_-]+) ]]; then
+                current_table="${BASH_REMATCH[2]}"
+            fi
+            [[ "$current_table" == "filter" ]] && continue
+            case "$current_table" in
+                samnet-filter|samnet-ports|honeypot|nat) ;;
+                *) continue ;;
+            esac
+            if [[ "$line" =~ (tcp|udp)[[:space:]]dport[[:space:]]([0-9]+) ]]; then
+                local proto="${BASH_REMATCH[1]}"
+                local port="${BASH_REMATCH[2]}"
+                local action="ACCEPT" color="${T_GREEN}"
+                [[ "$line" =~ accept ]] && action="ACCEPT" && color="${T_GREEN}"
+                [[ "$line" =~ drop ]] && action="DROP" && color="${T_RED}"
+                [[ "$line" =~ redirect ]] && action="REDIRECT" && color="${T_YELLOW}"
+                [[ "$line" =~ reject ]] && action="REJECT" && color="${T_RED}"
+                local src_color="${T_DIM}"
+                case "$current_table" in
+                    samnet-filter) src_color="${T_CYAN}" ;;
+                    samnet-ports) src_color="${T_GREEN}" ;;
+                    honeypot) src_color="${T_MAGENTA}" ;;
+                esac
+                output+="  ${color}$(printf '%-8s' "$port")${T_RESET} $(printf '%-7s' "$proto") ${src_color}$(printf '%-18s' "$current_table")${T_RESET} ${color}$(printf '%-12s' "$action")${T_RESET}\n"
+            fi
+        done < <(nft list ruleset 2>/dev/null)
+    fi
+    
+    # ─── 2. Check UFW ───
+    if command -v ufw &>/dev/null; then
+        local ufw_status=$(ufw status 2>/dev/null | head -1)
+        if [[ "$ufw_status" == *"active"* ]]; then
+            output+="\n  ${T_DIM}──────────────────────────────────────────────────────${T_RESET}\n"
+            output+="  ${T_BOLD}UFW (active):${T_RESET}\n"
+            
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                [[ "$line" == "Status:"* ]] && continue
+                [[ "$line" == "To"*"Action"* ]] && continue
+                [[ "$line" == "--"* ]] && continue
+                
+                local port="" proto="" action="ALLOW" ipver=""
+                [[ "$line" =~ "(v6)" ]] && ipver="v6"
+                
+                if [[ "$line" =~ ^([0-9]+)/(tcp|udp) ]]; then
+                    port="${BASH_REMATCH[1]}"; proto="${BASH_REMATCH[2]}"
+                elif [[ "$line" =~ ^([0-9]+)[[:space:]]on[[:space:]]([a-z0-9]+) ]]; then
+                    port="${BASH_REMATCH[1]}"; proto="on ${BASH_REMATCH[2]}"
+                elif [[ "$line" =~ ^([0-9]+)[[:space:]] ]] && [[ ! "$line" =~ "/" ]]; then
+                    port="${BASH_REMATCH[1]}"; proto="both"
+                fi
+                
+                [[ "$line" =~ ALLOW ]] && action="ALLOW"
+                [[ "$line" =~ DENY ]] && action="DENY"
+                
+                if [[ -n "$port" ]]; then
+                    local color="${T_GREEN}"
+                    [[ "$action" == "DENY" ]] && color="${T_RED}"
+                    local source="UFW"
+                    [[ -n "$ipver" ]] && source="UFW (v6)"
+                    output+="  ${color}$(printf '%-8s' "$port")${T_RESET} $(printf '%-7s' "$proto") ${T_BLUE}$(printf '%-18s' "$source")${T_RESET} ${color}$(printf '%-12s' "$action")${T_RESET}\n"
+                fi
+            done < <(ufw status 2>/dev/null)
+        else
+            output+="\n  ${T_DIM}UFW: inactive${T_RESET}\n"
+        fi
+    fi
+    
+    # ─── 3. Listening Services ───
+    output+="\n  ${T_DIM}──────────────────────────────────────────────────────${T_RESET}\n"
+    output+="  ${T_BOLD}Listening Services:${T_RESET} ${T_DIM}(top 10)${T_RESET}\n"
+    if command -v ss &>/dev/null; then
+        while read -r line; do
+            local port=$(echo "$line" | awk '{print $4}' | grep -oE '[0-9]+$')
+            local proc=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' || echo "-")
+            [[ -n "$port" ]] && output+="  ${T_DIM}$(printf '%-8s' "$port") tcp     $(printf '%-18s' "${proc:0:15}") (listening)${T_RESET}\n"
+        done < <(ss -tlnp 2>/dev/null | grep LISTEN | head -10)
+    fi
+    
+    output+="\n  ${T_DIM}Navigation: ↑↓/PgUp/PgDn to scroll, q to exit${T_RESET}\n"
+    
+    # Clear screen and display with scrolling via less
+    clear
+    printf "\n    ${T_GREEN}▸${T_RESET} ${T_WHITE}SAMNET${T_RESET} │ ${T_CYAN}Active Firewall Rules${T_RESET}\n"
+    printf "  ────────────────────────────────────────────────────────────────────────────────────\n\n"
+    
+    # Use less with color support and exit if content fits
+    echo -e "$output" | less -RFX
+}
+
+
 show_firewall_status() {
     ui_draw_header_mini "Firewall Rules"
     printf "    ${T_CYAN}${T_BOLD}Active nftables Rules:${T_RESET}\n"
     printf "    ${T_DIM}────────────────────────────────────────────${T_RESET}\n"
-    nft list ruleset 2>/dev/null | head -30 | while read line; do
+    nft list ruleset 2>/dev/null | head -50 | while read line; do
         printf "    ${T_DIM}%s${T_RESET}\n" "$line"
     done
     wait_key
@@ -6356,10 +7477,12 @@ full_uninstall() {
     echo "This will PERMANENTLY remove:"
     echo "  ${T_RED}•${T_RESET} Docker containers and images (samnet-api)"
     echo "  ${T_RED}•${T_RESET} WireGuard interface and all keys"
-    echo "  ${T_RED}•${T_RESET} Firewall rules (nftables)"
+    echo "  ${T_RED}•${T_RESET} SamNet firewall tables (samnet-filter, samnet-nat)"
     echo "  ${T_RED}•${T_RESET} Database and ALL peer data"
     echo "  ${T_RED}•${T_RESET} Installed files (/opt/samnet)"
     echo "  ${T_RED}•${T_RESET} Credentials file"
+    echo ""
+    echo "  ${T_GREEN}✓${T_RESET} ${T_DIM}Preserved: UFW, Docker rules, honeypot, other nftables${T_RESET}"
     echo ""
     echo "${T_YELLOW}This action CANNOT be undone!${T_RESET}"
     echo ""
@@ -6495,13 +7618,30 @@ full_uninstall() {
     
     # Step 4: Firewall
     log_info "[4/8] Removing firewall rules (created by samnet)..."
-    # Remove only our specific tables to preserve user custom rules
-
-    nft delete table inet samnet-filter 2>/dev/null && echo "  ✓ Removed table inet samnet-filter" || echo "  - Table inet samnet-filter not found"
-    nft delete table ip samnet-nat 2>/dev/null && echo "  ✓ Removed table ip samnet-nat" || echo "  - Table ip samnet-nat not found"
+    
+    # Remove VPN routing tables (always safe)
+    nft delete table inet samnet-filter 2>/dev/null && echo "  ✓ Removed samnet-filter (VPN rules)" || echo "  - samnet-filter not found"
+    nft delete table ip samnet-nat 2>/dev/null && echo "  ✓ Removed samnet-nat" || echo "  - samnet-nat not found"
+    nft delete table ip6 samnet-nat6 2>/dev/null && echo "  ✓ Removed samnet-nat6" || echo "  - samnet-nat6 not found"
+    rm -f /etc/nftables.conf 2>/dev/null && echo "  ✓ Removed /etc/nftables.conf"
+    
+    # Ask about user ports table
+    if nft list table inet samnet-ports &>/dev/null; then
+        echo ""
+        echo "  ${T_CYAN}Found custom port rules (samnet-ports table)${T_RESET}"
+        echo "  This contains your manually configured open ports (SSH, HTTP, etc.)"
+        read -r -p "  Delete your custom port rules? (yes/no) [default: no]: " del_ports
+        if [[ "${del_ports,,}" == "yes" ]]; then
+            nft delete table inet samnet-ports 2>/dev/null
+            rm -f /etc/samnet-ports.nft
+            echo "  ✓ Removed samnet-ports (custom port rules)"
+        else
+            echo "  - Preserved samnet-ports (your custom port rules still active)"
+            echo "  ${T_DIM}  Note: You can manage these with: nft list table inet samnet-ports${T_RESET}"
+        fi
+    fi
     
     # Clean up iptables rules added for Docker compatibility (wg0 forwarding)
-    # These are safe to remove - they only affect wg0 traffic
     local wan_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
     if [[ -n "$wan_iface" ]]; then
         iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null && echo "  ✓ Removed iptables wg0 forward rule"
@@ -6509,8 +7649,13 @@ full_uninstall() {
         iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null && echo "  ✓ Removed iptables wg0 NAT rule"
     fi
     
-    # NOTE: We deliberately do NOT delete generic tables like 'inet filter' or 'ip nat'
-    # as these may be used by Docker or other services. Only samnet-specific tables are removed.
+    # Explicitly state what we DON'T touch
+    echo ""
+    echo "  ${T_DIM}Preserved (not touched by SamNet):${T_RESET}"
+    echo "  ${T_DIM}  • UFW/iptables rules${T_RESET}"
+    echo "  ${T_DIM}  • Docker network rules${T_RESET}"
+    echo "  ${T_DIM}  • Other nftables tables (e.g., honeypot)${T_RESET}"
+    echo ""
     
     # Step 5: Database and data (samnet-wg specific paths)
     log_info "[5/8] Removing database and data..."
