@@ -68,7 +68,6 @@ Unlike standard scripts, SamNet-WG includes a **bi-directional sync engine**, en
 
 ### 🛡️ Security First
 - **Zero-Trust Architecture**: Strict IP validation and "Ghost Peer" prevention.
-- **Audit Logging**: Immutable logs for all admin actions.
 - **Scoped Uninstall**: Only `project=samnet-wg` labeled containers/images are removed.
 - **Non-Root Services**: API and UI run as unprivileged users in Docker.
 
@@ -116,24 +115,18 @@ The installer will guide you through setup (CLI-only or Web UI mode).
 sudo samnet    # Launch main menu
 ```
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  MAIN MENU                                                       │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│    [1]  Status Dashboard   System overview & health              │
-│    [2]  Install / Repair   Zero-touch setup & self-healing       │
-│    [3]  Peer Management    Create, list, limit, & edit peers     │
-│    [4]  Security & Access  Audit logs, user roles                │
-│    [5]  Observability      Live stats, graphs, & logs            │
-│    [6]  Advanced Tools     Firewall diff, backup, dry-run        │
-│    [7]  About / Docs       System paths & project info           │
-│    [8]  Uninstall          Safe, scoped removal                  │
-│                                                                  │
-│    [Q]  Quit                                                     │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-```
+| Key | Menu Option | Description |
+|:---:|-------------|-------------|
+| `1` | 📊 Status Dashboard | System overview & health |
+| `2` | 🔧 Install / Repair | Zero-touch setup & self-healing |
+| `3` | 👥 Peer Management | Create, list, limit, & edit peers |
+| `4` | 🔐 Security & Access | Audit logs, user roles |
+| `5` | 📈 Observability | Live stats, graphs, & logs |
+| `6` | ⚙️ Advanced Tools | Firewall diff, backup, dry-run |
+| `7` | 📖 About / Docs | System paths & project info |
+| `8` | 🗑️ Uninstall | Safe, scoped removal |
+| `Q` | 🚪 Quit | Exit the application |
+
 
 ### Common Operations
 
@@ -183,6 +176,7 @@ sudo samnet --uninstall
 
 ---
 
+
 ## 📁 File Locations
 
 We believe in full system transparency. Here is exactly where SamNet-WG stores its data:
@@ -217,7 +211,22 @@ We believe in full system transparency. Here is exactly where SamNet-WG stores i
 
 ---
 
+## 🗺️ Roadmap
+
+Coming in the next 1-2 weeks:
+
+| Feature | Description |
+|---------|-------------|
+| 🚀 **One-Line Install** | `curl -sSL https://... \| bash` for instant deployment |
+| 🔄 **Auto-Update** | `samnet --update` to upgrade without reinstalling |
+
+
+Stay tuned for updates!
+
+---
+
 ## 🤝 Contributing
+
 
 Contributions welcome!
 
