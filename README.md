@@ -1,4 +1,5 @@
-```
+<div align="center">
+<pre>
 ╔═══════════════════════════════════════════════════════════════════════════════════════╗
 ║                                                                                       ║
 ║  ███████╗ █████╗ ███╗   ███╗███╗   ██╗███████╗████████╗      ██╗    ██╗ ██████╗       ║
@@ -11,14 +12,15 @@
 ║                      Z E R O - T O U C H   W I R E G U A R D                          ║
 ║                        V P N   O R C H E S T R A T O R                                ║
 ║                                                                                       ║
-║                             [ v1.0.0 - samnet-wg ]                                    ║
+║                             [ v1.0.2 - samnet-wg ]                                    ║
 ║                                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════════════════════╝
-```
+</pre>
+</div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/SamNet-dev/wg-orchestrator)
+[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)](https://github.com/SamNet-dev/wg-orchestrator)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-orange.svg)]()
 [![WireGuard](https://img.shields.io/badge/WireGuard-Enabled-purple.svg)]()
@@ -30,11 +32,7 @@
 
 ---
 
-```
-╔═══════════════════════════════════════════════════════════════════════════╗
-║                          W H A T   I S   I T ?                            ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-```
+## ❓ What is it?
 
 **SamNet-WG** is a complete, enterprise-grade WireGuard VPN management solution that transforms any Linux server into a secure VPN appliance in under 5 minutes.
 
@@ -46,11 +44,7 @@ Unlike standard scripts, SamNet-WG includes a **bi-directional sync engine**, en
 
 ---
 
-```
-╔═══════════════════════════════════════════════════════════════════════════╗
-║                         S C R E E N S H O T S                             ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-```
+## 📸 Screenshots
 
 <div align="center">
 
@@ -70,11 +64,7 @@ Unlike standard scripts, SamNet-WG includes a **bi-directional sync engine**, en
 
 ---
 
-```
-╔═══════════════════════════════════════════════════════════════════════════╗
-║                           F E A T U R E S                                 ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-```
+## ✨ Features
 
 ### 🛡️ Security First
 - **Zero-Trust Architecture**: Strict IP validation and "Ghost Peer" prevention.
@@ -87,6 +77,12 @@ Unlike standard scripts, SamNet-WG includes a **bi-directional sync engine**, en
 - **System Transparency**: "About" screen explicitly lists all file paths.
 - **Auto-Init**: Bandwidth tracking and databases initialize automatically.
 - **Context Preservation**: Deep navigation menus that don't reset on refresh.
+
+### 🔥 Firewall Management
+- **Integrated Port Manager**: Manage open ports directly from the TUI (TCP/UDP support).
+- **Smart Detection**: Automatically detects and whitelists existing services (Web, DB, Monitoring) during install.
+- **Docker Compatible**: Runs safely alongside other containers without interfering with Docker networking.
+- **Mode Awareness**: Detects existing firewalls (UFW/iptables) and adapts automatically.
 
 ### 🌐 Management
 - **Sync Engine**: Edit files manually, use the CLI, or use the Web UI—it all stays in sync.
@@ -187,7 +183,7 @@ sudo samnet --uninstall
 
 ---
 
-`## 📁 File Locations`
+## 📁 File Locations
 
 We believe in full system transparency. Here is exactly where SamNet-WG stores its data:
 
@@ -202,7 +198,7 @@ We believe in full system transparency. Here is exactly where SamNet-WG stores i
 
 ---
 
-`## 🔒 Security`
+## 🔒 Security
 
 - **Argon2id** password hashing.
 - **CSRF tokens** on all state-changing API requests.
@@ -212,7 +208,7 @@ We believe in full system transparency. Here is exactly where SamNet-WG stores i
 
 ---
 
-`## 📋 Requirements`
+## 📋 Requirements
 
 - **OS**: Debian 11+, Ubuntu 20.04+, Raspberry Pi OS
 - **RAM**: 512 MB minimum
@@ -221,7 +217,7 @@ We believe in full system transparency. Here is exactly where SamNet-WG stores i
 
 ---
 
-`## 🤝 Contributing`
+## 🤝 Contributing
 
 Contributions welcome!
 
@@ -244,15 +240,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 <div align="center">
 
-```
-╔═══════════════════════════════════════════════════════════════════════════╗
-║                                                                           ║
-║   Built with ❤️ by Sam                                                    ║
-║                                                                           ║
-║   https://samnet.dev                                                      ║
-║                                                                           ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-```
+Built with ❤️ by [Sam](https://samnet.dev)
 
 **[⬆ Back to Top](#samnet-wg)**
 
