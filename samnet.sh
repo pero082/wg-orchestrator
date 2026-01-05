@@ -1919,7 +1919,7 @@ ListenPort = $port
 PrivateKey = $privkey
 MTU = $mtu
 SaveConfig = false
-PostUp = nft -f /etc/nftables.conf; [[ -f /etc/samnet-ports.nft ]] && nft -f /etc/samnet-ports.nft || true
+PostUp = nft -f /etc/samnet/samnet.nft; [[ -f /etc/samnet-ports.nft ]] && nft -f /etc/samnet-ports.nft || true
 PostDown = nft delete table inet samnet-filter 2>/dev/null; nft delete table ip samnet-nat 2>/dev/null; nft delete table ip6 samnet-nat6 2>/dev/null || true
 
 # Disable IPv6 for this interface specifically to avoid leaks
@@ -2274,10 +2274,16 @@ apply_firewall() {
     nft delete table ip samnet-nat 2>/dev/null || true
     nft delete table ip6 samnet-nat6 2>/dev/null || true
     
+    # ─── Create SamNet config directory ───
+    mkdir -p /etc/samnet
+    
     # ─── Mode-specific firewall setup ───
+    # Write to /etc/samnet/samnet.nft (NOT /etc/nftables.conf - preserves user config)
     if [[ "$firewall_mode" == "samnet" ]]; then
         # Full samnet firewall management (filter + nat)
-        cat > /etc/nftables.conf <<EOF
+        cat > /etc/samnet/samnet.nft <<EOF
+# SamNet-WG Firewall Rules
+# Auto-generated - do not edit manually
 table inet samnet-filter {
     chain input {
         type filter hook input priority 0; policy accept;
@@ -2313,7 +2319,7 @@ EOF
     else
         # External firewall mode (UFW/iptables) - only NAT rules for VPN, no filter
         # UFW/Docker manage their own filtering, we just add masquerading for VPN traffic
-        cat > /etc/nftables.conf <<EOF
+        cat > /etc/samnet/samnet.nft <<EOF
 # SamNet VPN NAT rules only (firewall managed externally)
 table ip samnet-nat {
     chain postrouting {
@@ -2330,7 +2336,32 @@ table ip6 samnet-nat6 {
 EOF
     fi
     
-    if ! nft -f /etc/nftables.conf; then
+    # ─── Add include to /etc/nftables.conf if not present (safe: preserves existing config) ───
+    local include_line='include "/etc/samnet/samnet.nft"'
+    if [[ -f /etc/nftables.conf ]]; then
+        if ! grep -qF "$include_line" /etc/nftables.conf; then
+            # Append include line to existing config
+            echo "" >> /etc/nftables.conf
+            echo "# SamNet-WG VPN rules (added by samnet installer)" >> /etc/nftables.conf
+            echo "$include_line" >> /etc/nftables.conf
+            log_info "Added SamNet include to /etc/nftables.conf"
+        fi
+    else
+        # No existing nftables.conf - create minimal one with shebang and include
+        cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+# nftables configuration
+
+flush ruleset
+
+# SamNet-WG VPN rules
+$include_line
+EOF
+        log_info "Created /etc/nftables.conf with SamNet include"
+    fi
+    
+    # Load our rules
+    if ! nft -f /etc/samnet/samnet.nft; then
         log_error "Firewall failed, rolling back..."
         nft -f "$backup" 2>/dev/null
         rm -f "$backup"
@@ -2359,17 +2390,22 @@ EOF
     log_success "Firewall rules applied (mode: $firewall_mode)"
     
     # ─── Docker/iptables Compatibility ───────────────────────────────────────
+    # All rules tagged with --comment "samnet-wg" for safe removal
     if command -v docker &>/dev/null || [[ -n "$(iptables -L FORWARD -n 2>/dev/null | grep DOCKER)" ]]; then
         if iptables -L FORWARD -n 2>/dev/null | grep -q "DOCKER"; then
             log_info "Docker detected - ensuring iptables compatibility..."
             
-            iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null || true
-            iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-            iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT
-            iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+            # Remove any existing samnet-wg tagged rules first (idempotent)
+            while iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT -m comment --comment "samnet-wg" 2>/dev/null; do :; done
+            while iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment "samnet-wg" 2>/dev/null; do :; done
             
-            iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null || true
-            iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE
+            # Add rules WITH comment tags (safe for removal)
+            iptables -I FORWARD 1 -i wg0 -o "$wan_iface" -j ACCEPT -m comment --comment "samnet-wg"
+            iptables -I FORWARD 2 -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment "samnet-wg"
+            
+            # NAT rule with comment tag
+            while iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE -m comment --comment "samnet-wg" 2>/dev/null; do :; done
+            iptables -t nat -A POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE -m comment --comment "samnet-wg"
             
             if ! command -v netfilter-persistent &>/dev/null; then
                  log_info "Installing iptables-persistent..."
@@ -2384,6 +2420,7 @@ EOF
         fi
     fi
 }
+
 
 # ─── User Ports Table Management ─────────────────────────────────────────────
 
@@ -3155,12 +3192,13 @@ run_install_wizard() {
                 esac
                 ;;
             4)
-                if ! run_firewall_mode_wizard; then
+                if ! run_firewall_mode_wizard "install"; then
                     ((step--))
                 else
                     ((step++))
                 fi
                 ;;
+
             5)
                 section "Subnet Selection"
                 run_subnet_wizard
@@ -6547,6 +6585,9 @@ EOF
 }
 
 run_firewall_mode_wizard() {
+    # Optional parameter: pass "install" to bypass WireGuard check during installation
+    local install_mode="${1:-}"
+    
     ui_draw_header_mini "Firewall Mode Selection"
     
     # Detect existing firewalls
@@ -6596,8 +6637,8 @@ run_firewall_mode_wizard() {
     local key=$(read_key)
     case "$key" in
         1)
-            # ─── Safety Check: WireGuard must be installed ───
-            if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+            # ─── Safety Check: WireGuard must be installed (bypass during install) ───
+            if [[ "$install_mode" != "install" ]] && [[ ! -f /etc/wireguard/wg0.conf ]]; then
                 printf "\n  ${T_RED}${T_BOLD}Cannot select SamNet Managed mode!${T_RESET}\n"
                 printf "  ${T_YELLOW}WireGuard is not installed.${T_RESET}\n\n"
                 printf "  SamNet Managed mode requires WireGuard to be installed first.\n"
@@ -6608,6 +6649,7 @@ run_firewall_mode_wizard() {
                 wait_key
                 return
             fi
+
             
             # ─── Smart Switch to SamNet Mode ───
             local vpn_port=$(db_get_config "listen_port")
@@ -6723,10 +6765,11 @@ run_firewall_mode_wizard() {
                 log_info "Cancelled"
             fi
             ;;
-        b|B|$'\x1b') return ;;
+        b|B|$'\x1b') return 1 ;;  # Return non-zero to signal "go back"
     esac
     wait_key
 }
+
 
 # ─── Show All Active Firewall Rules in Table Format ──────────────────────────
 
@@ -7619,11 +7662,27 @@ full_uninstall() {
     # Step 4: Firewall
     log_info "[4/8] Removing firewall rules (created by samnet)..."
     
-    # Remove VPN routing tables (always safe)
+    # Remove VPN routing tables (always safe - these are SamNet namespaced)
     nft delete table inet samnet-filter 2>/dev/null && echo "  ✓ Removed samnet-filter (VPN rules)" || echo "  - samnet-filter not found"
     nft delete table ip samnet-nat 2>/dev/null && echo "  ✓ Removed samnet-nat" || echo "  - samnet-nat not found"
     nft delete table ip6 samnet-nat6 2>/dev/null && echo "  ✓ Removed samnet-nat6" || echo "  - samnet-nat6 not found"
-    rm -f /etc/nftables.conf 2>/dev/null && echo "  ✓ Removed /etc/nftables.conf"
+    
+    # Remove SamNet include line from /etc/nftables.conf (PRESERVE the file itself)
+    if [[ -f /etc/nftables.conf ]]; then
+        if grep -qF 'include "/etc/samnet/samnet.nft"' /etc/nftables.conf; then
+            # Remove the include line and the comment above it
+            sed -i '/# SamNet-WG VPN rules/d' /etc/nftables.conf
+            sed -i '\|include "/etc/samnet/samnet.nft"|d' /etc/nftables.conf
+            # Clean up any resulting blank lines at end of file
+            sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' /etc/nftables.conf 2>/dev/null || true
+            echo "  ✓ Removed SamNet include from /etc/nftables.conf (file preserved)"
+        else
+            echo "  - No SamNet include found in /etc/nftables.conf"
+        fi
+    fi
+    
+    # Remove SamNet config directory
+    rm -rf /etc/samnet && echo "  ✓ Removed /etc/samnet directory" || echo "  - /etc/samnet not found"
     
     # Ask about user ports table
     if nft list table inet samnet-ports &>/dev/null; then
@@ -7641,21 +7700,32 @@ full_uninstall() {
         fi
     fi
     
-    # Clean up iptables rules added for Docker compatibility (wg0 forwarding)
+    # Clean up iptables rules - ONLY those tagged with "samnet-wg" comment
     local wan_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
     if [[ -n "$wan_iface" ]]; then
-        iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT 2>/dev/null && echo "  ✓ Removed iptables wg0 forward rule"
-        iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null && echo "  ✓ Removed iptables wg0 return rule"
-        iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE 2>/dev/null && echo "  ✓ Removed iptables wg0 NAT rule"
+        # Use while loop to remove ALL matching tagged rules (handles duplicates)
+        local removed_forward=false removed_return=false removed_nat=false
+        while iptables -D FORWARD -i wg0 -o "$wan_iface" -j ACCEPT -m comment --comment "samnet-wg" 2>/dev/null; do removed_forward=true; done
+        while iptables -D FORWARD -i "$wan_iface" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment "samnet-wg" 2>/dev/null; do removed_return=true; done
+        while iptables -t nat -D POSTROUTING -s 10.0.0.0/8 -o "$wan_iface" -j MASQUERADE -m comment --comment "samnet-wg" 2>/dev/null; do removed_nat=true; done
+        
+        [[ "$removed_forward" == true ]] && echo "  ✓ Removed iptables wg0 forward rule (samnet-wg tagged)"
+        [[ "$removed_return" == true ]] && echo "  ✓ Removed iptables wg0 return rule (samnet-wg tagged)"
+        [[ "$removed_nat" == true ]] && echo "  ✓ Removed iptables NAT rule (samnet-wg tagged)"
+        
+        # Persist the changes if netfilter-persistent is available
+        command -v netfilter-persistent &>/dev/null && netfilter-persistent save >/dev/null 2>&1
     fi
     
     # Explicitly state what we DON'T touch
     echo ""
     echo "  ${T_DIM}Preserved (not touched by SamNet):${T_RESET}"
-    echo "  ${T_DIM}  • UFW/iptables rules${T_RESET}"
+    echo "  ${T_DIM}  • /etc/nftables.conf (only removed SamNet include line)${T_RESET}"
+    echo "  ${T_DIM}  • UFW/iptables rules (only removed samnet-wg tagged rules)${T_RESET}"
     echo "  ${T_DIM}  • Docker network rules${T_RESET}"
     echo "  ${T_DIM}  • Other nftables tables (e.g., honeypot)${T_RESET}"
     echo ""
+
     
     # Step 5: Database and data (samnet-wg specific paths)
     log_info "[5/8] Removing database and data..."
