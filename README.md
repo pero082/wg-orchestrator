@@ -12,7 +12,7 @@
 ║                      Z E R O - T O U C H   W I R E G U A R D                          ║
 ║                        V P N   O R C H E S T R A T O R                                ║
 ║                                                                                       ║
-║                             [ v1.0.2 - samnet-wg ]                                    ║
+║                             [ v1.0.3 - samnet-wg ]                                    ║
 ║                                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════════════════════╝
 </pre>
@@ -20,7 +20,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)](https://github.com/SamNet-dev/wg-orchestrator)
+[![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)](https://github.com/SamNet-dev/wg-orchestrator)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-orange.svg)]()
 [![WireGuard](https://img.shields.io/badge/WireGuard-Enabled-purple.svg)]()
@@ -250,7 +250,5 @@ MIT License - See [LICENSE](LICENSE) for details.
 <div align="center">
 
 Built with ❤️ by [Sam](https://samnet.dev)
-
-**[⬆ Back to Top](#samnet-wg)**
 
 </div>

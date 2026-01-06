@@ -1,7 +1,7 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
 # SamNet-WG Unified Manager, Installer & CLI/TUI
-# Version: 1.0.2
+# Version: 1.0.3
 # Author: Sam Hesami | samnet.dev
 # License: MIT
 #
@@ -21,7 +21,7 @@ export LC_ALL=C.UTF-8
 # 1. GLOBAL CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-readonly SAMNET_VERSION="1.0.2"
+readonly SAMNET_VERSION="1.0.3"
 readonly APP_NAME="SamNet-WG"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -199,23 +199,8 @@ ui_checkbox() {
 }
 
 
-ensure_early_dependencies() {
-    # Only core CLI deps - Docker handled later if Web UI enabled
-    local deps=("curl" "wg" "sqlite3" "qrencode" "xxd" "openssl")
-    local missing=()
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then missing+=("$dep"); fi
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo -e "${T_YELLOW}Installing missing dependencies: ${missing[*]}${T_RESET}"
-        if [[ -f /etc/debian_version ]]; then
-            apt-get update -qq &>/dev/null
-            apt-get install -y -qq wireguard sqlite3 qrencode curl xxd openssl &>/dev/null
-        fi
-    fi
-}
-
 # ─── Terminal Control ─────────────────────────────────────────────────────────
+
 
 get_term_size() {
     if command -v tput &>/dev/null && [[ -t 1 ]]; then
@@ -1085,8 +1070,10 @@ api_call() {
 # Check if a port is available
 is_port_available() {
     local port=$1
-    ! (ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null) | grep -q ":${port}\s"
+    # Use ss with sport filter (more reliable than grep with \s which isn't portable)
+    ! ss -Htuln sport = ":$port" 2>/dev/null | grep -q .
 }
+
 
 # Find an available port starting from the given port
 find_available_port() {
@@ -1836,7 +1823,8 @@ decrypt_peer_key() {
 encrypt_peer_key() {
     local plaintext="$1"
     
-    # PRIORITY 1: Use running API container (Guarantees crypto compatibility)
+    # Use running API container (Guarantees crypto compatibility)
+    # The API is always deployed, so this should always succeed
     if docker ps -q --filter "name=samnet-wg-api" | grep -q . || docker ps -q --filter "name=samnet-api" | grep -q .; then
         local api_container=$(docker ps --format '{{.Names}}' | grep -E "^samnet(-wg)?-api$" | head -1)
         local api_result
@@ -1847,14 +1835,16 @@ encrypt_peer_key() {
                  return 0
             fi
         fi
-        log_debug "Container encryption failed for '$api_container', falling back..."
+        log_debug "Container encryption failed for '$api_container'"
     fi
     
-    # Fallback to plaintext if encryption fails (better than nothing for CLI, but Web UI will fail)
-    # The API's self-healing logic in syncPeersWithFiles will attempt to encrypt this later.
-    echo "$plaintext"
+    # SECURITY: Never fall back to plaintext or unreliable local encryption
+    # The API container should always be running after install
+    log_error "Encryption failed: API container not available. Start with: docker start samnet-wg-api"
     return 1
 }
+
+
 
 # Install rollback function for transactional safety
 rollback_install() {
@@ -3228,62 +3218,6 @@ run_install_wizard() {
     done
 }
 
-run_firewall_mode_wizard() {
-    section "Firewall Configuration"
-    
-    printf "  ${C_BOLD}How would you like to manage firewall ports?${C_RESET}\n\n"
-    
-    menu_option "1" "SamNet Managed (Recommended)" "SamNet controls ports via TUI"
-    menu_option "2" "External Firewall (UFW/iptables)" "You manage ports with UFW"
-    menu_option "3" "No Firewall Management" "SamNet touches nothing"
-    menu_option "B" "Back" ""
-    
-    printf "\n${C_CYAN}❯${C_RESET} "
-    local c=$(read_key)
-    
-    case "${c^^}" in
-        1)
-            # Check if switching FROM external mode - warn about potential lockout
-            local current_mode=$(db_get_config "firewall_mode")
-            if [[ "$current_mode" == "external" || "$current_mode" == "none" ]]; then
-                echo ""
-                log_warn "Switching to SamNet Managed mode"
-                echo ""
-                echo "  ${T_CYAN}What happens:${T_RESET}"
-                echo "    • SSH (22) and WireGuard VPN will be open"
-                echo "    • Docker bridge traffic will be allowed"
-                echo "    • Running services will be auto-detected and whitelisted"
-                echo "      (ports: 80, 443, 3000, 9090, databases, etc.)"
-                echo ""
-                echo "  ${T_YELLOW}Note:${T_RESET} Your existing UFW/iptables rules will NOT be migrated."
-                echo "  You can add/remove ports anytime via: Security & Access → Firewall Ports"
-                echo ""
-                read -r -p "  Continue with auto-detection? (yes/no): " confirm
-                if [[ "${confirm,,}" != "yes" ]]; then
-                    log_info "Cancelled. Keeping current mode: $current_mode"
-                    return 1
-                fi
-            fi
-            db_set_config "firewall_mode" "samnet"
-            log_success "Selected: SamNet Managed"
-            return 0
-            ;;
-        2)
-            db_set_config "firewall_mode" "external"
-            log_success "Selected: External Firewall"
-            return 0
-            ;;
-        3)
-            db_set_config "firewall_mode" "none"
-            log_success "Selected: No Management"
-            return 0
-            ;;
-        B) return 1 ;;
-        *)
-            run_firewall_mode_wizard
-            ;;
-    esac
-}
 
 run_subnet_wizard() {
     WIZARD_SUBNET=""
