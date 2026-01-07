@@ -578,7 +578,6 @@ ui_confirm() {
     printf "    ${T_YELLOW}⚠${T_RESET} %s ${T_DIM}[y/N]${T_RESET} " "$message"
     read -rsn1 response
     printf "%s\n" "$response"
-    printf "%s\n" "$response"
     if [[ "$response" == "y" || "$response" == "Y" ]]; then
         return 0
     else
@@ -2337,12 +2336,13 @@ EOF
             log_info "Added SamNet include to /etc/nftables.conf"
         fi
     else
-        # No existing nftables.conf - create minimal one with shebang and include
+        # No existing nftables.conf - create minimal one with SamNet include only
+        # NOTE: We intentionally do NOT flush ruleset to avoid wiping any existing nft rules
+        log_warn "No /etc/nftables.conf found - creating minimal config"
         cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
-# nftables configuration
-
-flush ruleset
+# nftables configuration (created by SamNet-WG)
+# Add your custom rules here if needed
 
 # SamNet-WG VPN rules
 $include_line
@@ -2424,14 +2424,54 @@ create_samnet_ports_table() {
     local common_ports="80 443 8080 8443 3000 9090 9100 3306 5432 6379 27017 25 587 993 995"
     
     for port in $common_ports; do
-        if ss -tlnH 2>/dev/null | grep -qE ":${port}\s"; then
+        # Use ss filter instead of grep with non-portable \s
+        if ss -tlnH sport = ":$port" 2>/dev/null | grep -q .; then
             detected_ports="$detected_ports $port"
         fi
     done
     
-    # Build the dynamic port rules
+    # Build the dynamic port rules - but ASK USER FIRST
     local port_rules=""
-    for port in $detected_ports; do
+    local approved_ports=""
+    
+    if [[ -n "$detected_ports" ]]; then
+        echo ""
+        log_warn "Auto-detected running services on ports:$detected_ports"
+        echo ""
+        echo "  ${T_CYAN}Detected services:${T_RESET}"
+        for port in $detected_ports; do
+            case $port in
+                80)   echo "    • Port 80 (HTTP)" ;;
+                443)  echo "    • Port 443 (HTTPS)" ;;
+                8080) echo "    • Port 8080 (Alt HTTP)" ;;
+                8443) echo "    • Port 8443 (Alt HTTPS)" ;;
+                3000) echo "    • Port 3000 (Grafana/Dev)" ;;
+                9090) echo "    • Port 9090 (Prometheus)" ;;
+                9100) echo "    • Port 9100 (Node Exporter)" ;;
+                3306) echo "    • Port 3306 (MySQL)" ;;
+                5432) echo "    • Port 5432 (PostgreSQL)" ;;
+                6379) echo "    • Port 6379 (Redis)" ;;
+                27017) echo "    • Port 27017 (MongoDB)" ;;
+                25)   echo "    • Port 25 (SMTP)" ;;
+                587)  echo "    • Port 587 (Mail Submission)" ;;
+                993)  echo "    • Port 993 (IMAPS)" ;;
+                995)  echo "    • Port 995 (POP3S)" ;;
+            esac
+        done
+        echo ""
+        echo "  ${T_YELLOW}Opening these ports will allow external access.${T_RESET}"
+        read -r -p "  Open detected service ports? (yes/no) [default: no]: " open_detected
+        
+        if [[ "${open_detected,,}" == "yes" ]]; then
+            approved_ports="$detected_ports"
+            log_success "Approved:$approved_ports"
+        else
+            log_info "Skipped auto-detected ports (only SSH + VPN will be open)"
+        fi
+    fi
+    
+    # Build rules only for approved ports
+    for port in $approved_ports; do
         case $port in
             80)   port_rules="${port_rules}        tcp dport 80 accept comment \"http-detected\"\n" ;;
             443)  port_rules="${port_rules}        tcp dport 443 accept comment \"https-detected\"\n" ;;
@@ -2450,10 +2490,7 @@ create_samnet_ports_table() {
             995)  port_rules="${port_rules}        tcp dport 995 accept comment \"pop3s-detected\"\n" ;;
         esac
     done
-    
-    if [[ -n "$detected_ports" ]]; then
-        log_info "Auto-detected services:$detected_ports"
-    fi
+
     
     # Using 'inet' family covers both IPv4 and IPv6
     # Priority -10 ensures this runs before standard filter chains
@@ -2484,8 +2521,8 @@ EOF
     
     persist_samnet_ports
     
-    local count=$(echo "$detected_ports" | wc -w)
-    log_success "Firewall created: SSH + VPN + Docker + $count detected services"
+    local count=$(echo "$approved_ports" | wc -w)
+    log_success "Firewall created: SSH + VPN + Docker + $count approved services"
 }
 
 update_vpn_port_rule() {
@@ -7481,6 +7518,7 @@ full_uninstall() {
     read -r -p "Type 'UNINSTALL' in capitals to proceed: " confirm2
     if [[ "$confirm2" != "UNINSTALL" ]]; then
         echo "${T_GREEN}Cancelled.${T_RESET}"
+        return 0
     fi
     
     echo ""
